@@ -1,4 +1,5 @@
 AC_INIT(include/libxfs.h)
+AC_PREREQ(2.50)
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_HEADER(include/platform_defs.h)
@@ -76,9 +77,12 @@ esac
 AC_SUBST([root_sbindir])
 AC_SUBST([root_libdir])
 
-# Find localized files
+# Find localized files.  Don't descend into any "dot directories"
+# (like .git or .pc from quilt).  Strangely, the "-print" argument
+# to "find" is required, to avoid including such directories in the
+# list.
 LOCALIZED_FILES=""
-for lfile in `find ${srcdir} -name '*.c' -type f || exit 1`; do
+for lfile in `find ${srcdir} -path './.??*' -prune -o -name '*.c' -type f -print || exit 1`; do
     LOCALIZED_FILES="$LOCALIZED_FILES \$(TOPDIR)/$lfile"
 done
 AC_SUBST(LOCALIZED_FILES)
@@ -103,6 +107,7 @@ AC_HAVE_SENDFILE
 AC_HAVE_GETMNTENT
 AC_HAVE_GETMNTINFO
 AC_HAVE_FALLOCATE
+AC_HAVE_FIEMAP
 AC_HAVE_BLKID_TOPO($enable_blkid)
 
 AC_TYPE_PSINT

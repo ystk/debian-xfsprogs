@@ -47,12 +47,23 @@ blkmap_alloc(
 	if (nex < 1)
 		nex = 1;
 
+	if (nex > BLKMAP_NEXTS_MAX) {
+#if (BITS_PER_LONG == 32)
+		do_warn(
+	_("Number of extents requested in blkmap_alloc (%d) overflows 32 bits.\n"
+	  "If this is not a corruption, then you will need a 64 bit system\n"
+	  "to repair this filesystem.\n"),
+			nex);
+#endif
+		return NULL;
+	}
+
 	key = whichfork ? ablkmap_key : dblkmap_key;
 	blkmap = pthread_getspecific(key);
 	if (!blkmap || blkmap->naexts < nex) {
 		blkmap = realloc(blkmap, BLKMAP_SIZE(nex));
 		if (!blkmap) {
-			do_warn(_("malloc failed in blkmap_alloc (%u bytes)\n"),
+			do_warn(_("malloc failed in blkmap_alloc (%zu bytes)\n"),
 				BLKMAP_SIZE(nex));
 			return NULL;
 		}
@@ -66,12 +77,30 @@ blkmap_alloc(
 
 /*
  * Free a block map.
+ *
+ * If the map is a large, uncommon size (say for hundreds of thousands of
+ * extents) then free it to release the memory. This prevents us from pinning
+ * large tracts of memory due to corrupted fork values or one-off fragmented
+ * files. Otherwise we have nothing to do but keep the memory around for the
+ * next inode
  */
 void
 blkmap_free(
 	blkmap_t	*blkmap)
 {
-	/* nothing to do! - keep the memory around for the next inode */
+	if (!blkmap)
+		return;
+
+	/* consider more than 100k extents rare */
+	if (blkmap->naexts < 100 * 1024)
+		return;
+
+	if (blkmap == pthread_getspecific(dblkmap_key))
+		pthread_setspecific(dblkmap_key, NULL);
+	else
+		pthread_setspecific(ablkmap_key, NULL);
+
+	free(blkmap);
 }
 
 /*
@@ -141,7 +170,7 @@ blkmap_getn(
 		 */
 		bmp = malloc(nb * sizeof(bmap_ext_t));
 		if (!bmp)
-			do_error(_("blkmap_getn malloc failed (%u bytes)\n"),
+			do_error(_("blkmap_getn malloc failed (%" PRIu64 " bytes)\n"),
 						nb * sizeof(bmap_ext_t));
 
 		bmp[nex].startblock = ext->startblock + (o - ext->startoff);
@@ -207,29 +236,51 @@ blkmap_next_off(
  */
 static blkmap_t *
 blkmap_grow(
-	blkmap_t	**blkmapp)
+	blkmap_t	*blkmap)
 {
 	pthread_key_t	key = dblkmap_key;
-	blkmap_t	*blkmap = *blkmapp;
+	blkmap_t	*new_blkmap;
+	int		new_naexts = blkmap->naexts + 4;
 
 	if (pthread_getspecific(key) != blkmap) {
 		key = ablkmap_key;
 		ASSERT(pthread_getspecific(key) == blkmap);
 	}
 
-	blkmap->naexts += 4;
-	blkmap = realloc(blkmap, BLKMAP_SIZE(blkmap->naexts));
-	if (blkmap == NULL)
+	if (new_naexts > BLKMAP_NEXTS_MAX) {
+#if (BITS_PER_LONG == 32)
+		do_error(
+	_("Number of extents requested in blkmap_grow (%d) overflows 32 bits.\n"
+	  "You need a 64 bit system to repair this filesystem.\n"),
+			new_naexts);
+#endif
+		return NULL;
+	}
+	if (new_naexts <= 0) {
+		do_error(
+	_("Number of extents requested in blkmap_grow (%d) overflowed the\n"
+	  "maximum number of supported extents (%d).\n"),
+			new_naexts, BLKMAP_NEXTS_MAX);
+		return NULL;
+	}
+
+	new_blkmap = realloc(blkmap, BLKMAP_SIZE(new_naexts));
+	if (!new_blkmap) {
 		do_error(_("realloc failed in blkmap_grow\n"));
-	*blkmapp = blkmap;
-	pthread_setspecific(key, blkmap);
-	return blkmap;
+		return NULL;
+	}
+	new_blkmap->naexts = new_naexts;
+	pthread_setspecific(key, new_blkmap);
+	return new_blkmap;
 }
 
 /*
  * Set an extent into a block map.
+ *
+ * If this function fails, it leaves the blkmapp untouched so the caller can
+ * handle the error and free the blkmap appropriately.
  */
-void
+int
 blkmap_set_ext(
 	blkmap_t	**blkmapp,
 	xfs_dfiloff_t	o,
@@ -239,9 +290,14 @@ blkmap_set_ext(
 	blkmap_t	*blkmap = *blkmapp;
 	xfs_extnum_t	i;
 
-	if (blkmap->nexts == blkmap->naexts)
-		blkmap = blkmap_grow(blkmapp);
+	if (blkmap->nexts == blkmap->naexts) {
+		blkmap = blkmap_grow(blkmap);
+		if (!blkmap)
+			return ENOMEM;
+		*blkmapp = blkmap;
+	}
 
+	ASSERT(blkmap->nexts < blkmap->naexts);
 	for (i = 0; i < blkmap->nexts; i++) {
 		if (blkmap->exts[i].startoff > o) {
 			memmove(blkmap->exts + i + 1,
@@ -255,4 +311,5 @@ blkmap_set_ext(
 	blkmap->exts[i].startblock = b;
 	blkmap->exts[i].blockcount = c;
 	blkmap->nexts++;
+	return 0;
 }

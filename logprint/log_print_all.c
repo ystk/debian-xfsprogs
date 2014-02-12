@@ -36,10 +36,10 @@ xlog_print_find_oldest(
 
 	first_blk = 0;		/* read first block */
 	bp = xlog_get_bp(log, 1);
-	xlog_bread(log, 0, 1, bp);
+	xlog_bread_noalign(log, 0, 1, bp);
 	first_half_cycle = xlog_get_cycle(XFS_BUF_PTR(bp));
 	*last_blk = log->l_logBBsize-1;	/* read last block */
-	xlog_bread(log, *last_blk, 1, bp);
+	xlog_bread_noalign(log, *last_blk, 1, bp);
 	last_half_cycle = xlog_get_cycle(XFS_BUF_PTR(bp));
 	ASSERT(last_half_cycle != 0);
 
@@ -108,12 +108,16 @@ xlog_recover_print_buffer(
 			printf(_("	SUPER Block Buffer:\n"));
 			if (!print_buffer) 
 				continue;
-			printf(_("		icount:%Ld  ifree:%Ld  "),
-			       be64_to_cpu(*(__be64 *)(p)),
-			       be64_to_cpu(*(__be64 *)(p+8)));
-			printf(_("fdblks:%Ld  frext:%Ld\n"),
-			       be64_to_cpu(*(__be64 *)(p+16)),
-			       be64_to_cpu(*(__be64 *)(p+24)));
+		       printf(_("              icount:%llu ifree:%llu  "),
+			       (unsigned long long)
+				       be64_to_cpu(*(__be64 *)(p)),
+			       (unsigned long long)
+				       be64_to_cpu(*(__be64 *)(p+8)));
+		       printf(_("fdblks:%llu  frext:%llu\n"),
+			       (unsigned long long)
+				       be64_to_cpu(*(__be64 *)(p+16)),
+			       (unsigned long long)
+				       be64_to_cpu(*(__be64 *)(p+24)));
 			printf(_("		sunit:%u  swidth:%u\n"),
 			       be32_to_cpu(*(__be32 *)(p+56)),
 			       be32_to_cpu(*(__be32 *)(p+60)));
@@ -486,19 +490,16 @@ xlog_recover_print_item(
 void
 xlog_recover_print_trans(
 	xlog_recover_t		*trans,
-	xlog_recover_item_t	*itemq,
+	struct list_head	*itemq,
 	int			print)
 {
-	xlog_recover_item_t	*first_item, *item;
+	xlog_recover_item_t	*item;
 
 	if (print < 3)
 		return;
 
 	print_xlog_record_line();
 	xlog_recover_print_trans_head(trans);
-	item = first_item = itemq;
-	do {
+	list_for_each_entry(item, itemq, ri_list)
 		xlog_recover_print_item(item);
-		item = item->ri_next;
-	} while (first_item != item);
 }

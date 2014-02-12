@@ -71,6 +71,7 @@ char *trans_type[] = {
 	"GROWFSRT_FREE",
 	"SWAPEXT",
 	"SB_COUNT",
+	"CHECKPOINT",
 };
 
 typedef struct xlog_split_item {
@@ -306,12 +307,14 @@ xlog_print_trans_buffer(xfs_caddr_t *ptr, int len, int *i, int num_ops)
 			 */
 			memmove(&x, *ptr, sizeof(__be64));
 			memmove(&y, *ptr+8, sizeof(__be64));
-			printf(_("icount: %lld  ifree: %lld  "),
-				be64_to_cpu(x), be64_to_cpu(y));
+		       printf(_("icount: %llu  ifree: %llu  "),
+			       (unsigned long long) be64_to_cpu(x),
+			       (unsigned long long) be64_to_cpu(y));
 			memmove(&x, *ptr+16, sizeof(__be64));
 			memmove(&y, *ptr+24, sizeof(__be64));
-			printf(_("fdblks: %lld  frext: %lld\n"),
-				be64_to_cpu(x), be64_to_cpu(y));
+		       printf(_("fdblks: %llu  frext: %llu\n"),
+			       (unsigned long long) be64_to_cpu(x),
+			       (unsigned long long) be64_to_cpu(y));
 		}
 		super_block = 0;
 	} else if (be32_to_cpu(*(__be32 *)(*ptr)) == XFS_AGI_MAGIC) {
@@ -394,18 +397,22 @@ xlog_print_trans_buffer(xfs_caddr_t *ptr, int len, int *i, int num_ops)
 				dq->d_version, dq->d_flags,
 				be32_to_cpu(dq->d_id));
 			printf(_("blk limits  hard: %llu  soft: %llu\n"),
-				be64_to_cpu(dq->d_blk_hardlimit),
-				be64_to_cpu(dq->d_blk_softlimit));
+			       (unsigned long long)
+				       be64_to_cpu(dq->d_blk_hardlimit),
+			       (unsigned long long)
+				       be64_to_cpu(dq->d_blk_softlimit));
 			printf(_("blk  count: %llu  warns: %d  timer: %d\n"),
-				be64_to_cpu(dq->d_bcount),
-				be16_to_cpu(dq->d_bwarns),
+			       (unsigned long long) be64_to_cpu(dq->d_bcount),
+			       (int) be16_to_cpu(dq->d_bwarns),
 				be32_to_cpu(dq->d_btimer));
 			printf(_("ino limits  hard: %llu  soft: %llu\n"),
-				be64_to_cpu(dq->d_ino_hardlimit),
-				be64_to_cpu(dq->d_ino_softlimit));
+			       (unsigned long long)
+				       be64_to_cpu(dq->d_ino_hardlimit),
+			       (unsigned long long)
+				       be64_to_cpu(dq->d_ino_softlimit));
 			printf(_("ino  count: %llu  warns: %d  timer: %d\n"),
-				be64_to_cpu(dq->d_icount),
-				be16_to_cpu(dq->d_iwarns),
+			       (unsigned long long) be64_to_cpu(dq->d_icount),
+			       (int) be16_to_cpu(dq->d_iwarns),
 				be32_to_cpu(dq->d_itimer));
 		}
 	} else {
@@ -573,7 +580,7 @@ xlog_print_dir_sf(xfs_dir_shortform_t *sfp, int size)
 	printf(_("SHORTFORM DIRECTORY size %d count %d\n"),
 	       size, sfp->hdr.count);
 	memmove(&ino, &(sfp->hdr.parent), sizeof(ino));
-	printf(_(".. ino 0x%llx\n"), be64_to_cpu(*(__be64 *)&ino));
+       printf(_(".. ino 0x%llx\n"), (unsigned long long) be64_to_cpu(ino));
 
 	count = (uint)(sfp->hdr.count);
 	sfep = &(sfp->list[0]);
@@ -642,7 +649,7 @@ xlog_print_trans_inode(xfs_caddr_t *ptr, int len, int *i, int num_ops)
     mode = dino.di_mode & S_IFMT;
     size = (int)dino.di_size;
     xlog_print_trans_inode_core(&dino);
-    *ptr += sizeof(xfs_dinode_core_t);
+    *ptr += sizeof(xfs_icdinode_t);
 
     if (*i == num_ops-1 && f->ilf_size == 3)  {
 	return 1;

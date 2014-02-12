@@ -24,10 +24,9 @@
 #include "err_protos.h"
 #include "incore.h"
 #include "progress.h"
+#include "scan.h"
 
 void	set_mp(xfs_mount_t *mpp);
-void	scan_ag(xfs_agnumber_t agno);
-void	validate_sb(struct xfs_sb *sb);
 
 /* workaround craziness in the xlog routines */
 int xlog_recover_do_trans(xlog_t *log, xlog_recover_t *t, int p) { return 0; }
@@ -68,7 +67,8 @@ zero_log(xfs_mount_t *mp)
 			error);
 	} else {
 		if (verbose) {
-			do_warn(_("zero_log: head block %lld tail block %lld\n"),
+			do_warn(
+	_("zero_log: head block %" PRId64 " tail block %" PRId64 "\n"),
 				head_blk, tail_blk);
 		}
 		if (head_blk != tail_blk) {
@@ -107,9 +107,10 @@ zero_log(xfs_mount_t *mp)
  */
 
 void
-phase2(xfs_mount_t *mp)
+phase2(
+	struct xfs_mount	*mp,
+	int			scan_threads)
 {
-	xfs_agnumber_t		i;
 	int			j;
 	ino_tree_node_t		*ino_rec;
 
@@ -138,24 +139,14 @@ phase2(xfs_mount_t *mp)
 
 	set_progress_msg(PROG_FMT_SCAN_AG, (__uint64_t) glob_agcount);
 
-	for (i = 0; i < mp->m_sb.sb_agcount; i++)  {
-		scan_ag(i);
-#ifdef XR_INODE_TRACE
-		print_inode_list(i);
-#endif
-	}
-
-	/*
-	 * Validate that our manual counts match the superblock.
-	 */
-	validate_sb(&mp->m_sb);
+	scan_ags(mp, scan_threads);
 
 	print_final_rpt();
 
 	/*
 	 * make sure we know about the root inode chunk
 	 */
-	if ((ino_rec = find_inode_rec(0, mp->m_sb.sb_rootino)) == NULL)  {
+	if ((ino_rec = find_inode_rec(mp, 0, mp->m_sb.sb_rootino)) == NULL)  {
 		ASSERT(mp->m_sb.sb_rbmino == mp->m_sb.sb_rootino + 1 &&
 			mp->m_sb.sb_rsumino == mp->m_sb.sb_rootino + 2);
 		do_warn(_("root inode chunk not found\n"));
@@ -163,7 +154,7 @@ phase2(xfs_mount_t *mp)
 		/*
 		 * mark the first 3 used, the rest are free
 		 */
-		ino_rec = set_inode_used_alloc(0,
+		ino_rec = set_inode_used_alloc(mp, 0,
 				(xfs_agino_t) mp->m_sb.sb_rootino);
 		set_inode_used(ino_rec, 1);
 		set_inode_used(ino_rec, 2);

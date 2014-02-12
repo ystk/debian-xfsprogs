@@ -25,6 +25,7 @@ OPTIMIZER = @opt_build@
 MALLOCLIB = @malloc_lib@
 LOADERFLAGS = @LDFLAGS@
 LTLDFLAGS = @LDFLAGS@
+CFLAGS = @CFLAGS@
 
 LIBRT = @librt@
 LIBUUID = @libuuid@
@@ -71,6 +72,7 @@ MAKE		= @make@
 ECHO		= @echo@
 SORT		= @sort@
 LN_S		= @LN_S@
+SHELL		= @SHELL@
 LIBTOOL		= @LIBTOOL@
 MAKEDEPEND	= @makedepend@
 
@@ -98,6 +100,7 @@ HAVE_SENDFILE = @have_sendfile@
 HAVE_GETMNTENT = @have_getmntent@
 HAVE_GETMNTINFO = @have_getmntinfo@
 HAVE_FALLOCATE = @have_fallocate@
+HAVE_FIEMAP = @have_fiemap@
 
 GCCFLAGS = -funsigned-char -fno-strict-aliasing -Wall 
 #	   -Wbitwise -Wno-transparent-union -Wno-old-initializer -Wno-decl

@@ -41,6 +41,10 @@ free_help(void)
 "\n"));
 }
 
+/*
+ * The data and realtime block counts returned (count, used, and
+ * free) are all in basic block units.
+ */
 static int
 mount_free_space_data(
 	struct fs_path		*mount,
@@ -104,6 +108,10 @@ mount_free_space_data(
 	return 1;
 }
 
+/*
+ * The data and realtime block counts returned (count, used, and
+ * free) are all in basic block units.
+ */
 static int
 projects_free_space_data(
 	struct fs_path		*path,
@@ -173,20 +181,22 @@ projects_free_space_data(
 	}
 
 	if (d.d_blk_softlimit) {
-		*bcount = d.d_blk_softlimit << 1;
-		*bfree = (d.d_blk_softlimit - d.d_bcount) << 1;
+		*bcount = d.d_blk_softlimit;
+		*bfree = (d.d_blk_softlimit - d.d_bcount);
 	}
-	*bused = d.d_bcount << 1;
+	*bused = d.d_bcount;
+
 	if (d.d_ino_softlimit) {
 		*icount = d.d_ino_softlimit;
 		*ifree = (d.d_ino_softlimit - d.d_icount);
 	}
 	*iused = d.d_icount;
+
 	if (d.d_rtb_softlimit) {
-		*rcount = d.d_rtb_softlimit << 1;
-		*rfree = (d.d_rtb_softlimit - d.d_rtbcount) << 1;
+		*rcount = d.d_rtb_softlimit;
+		*rfree = (d.d_rtb_softlimit - d.d_rtbcount);
 	}
-	*rcount = d.d_rtbcount << 1;
+	*rused = d.d_rtbcount;
 
 	close(fd);
 	return 1;
@@ -287,14 +297,13 @@ static void
 free_space_list(
 	FILE			*fp,
 	uint			form,
-	uint			type,
 	char			*dir,
 	uint			flags)
 {
 	fs_cursor_t		cursor;
 	fs_path_t		*path;
 
-	fs_cursor_initialise(dir, type, &cursor);
+	fs_cursor_initialise(dir, 0, &cursor);
 	while ((path = fs_cursor_next_entry(&cursor))) {
 		if (free_space(fp, form, path, flags))
 			flags |= NO_HEADER_FLAG;
@@ -308,7 +317,7 @@ free_f(
 {
 	FILE		*fp = NULL;
 	char		*fname = NULL;
-	int		c, flags = 0, form = 0, type = 0;
+	int		c, flags = 0, form = 0;
 
 	while ((c = getopt(argc, argv, "bf:hNir")) != EOF) {
 		switch (c) {
@@ -338,16 +347,13 @@ free_f(
 	if (!form)
 		form = XFS_BLOCK_QUOTA;
 
-	if (!type)
-		type = FS_MOUNT_POINT|FS_PROJECT_PATH;
-
 	if ((fp = fopen_write_secure(fname)) == NULL)
 		return 0;
 
 	if (argc == optind)
-		free_space_list(fp, form, type, NULL, flags);
+		free_space_list(fp, form, NULL, flags);
 	else while (argc > optind)
-		free_space_list(fp, form, type, argv[optind++], flags);
+		free_space_list(fp, form, argv[optind++], flags);
 
 	if (fname)
 		fclose(fp);
@@ -357,8 +363,8 @@ free_f(
 void
 free_init(void)
 {
-	free_cmd.name = _("df");
-	free_cmd.altname = _("free");
+	free_cmd.name = "df";
+	free_cmd.altname = "free";
 	free_cmd.cfunc = free_f;
 	free_cmd.argmin = 0;
 	free_cmd.argmax = -1;

@@ -207,9 +207,11 @@ libxfs_trace_readbuf(const char *func, const char *file, int line, dev_t dev, xf
 {
 	xfs_buf_t	*bp = libxfs_readbuf(dev, blkno, len, flags);
 
-	bp->b_func = func;
-	bp->b_file = file;
-	bp->b_line = line;
+       if (bp){
+               bp->b_func = func;
+               bp->b_file = file;
+               bp->b_line = line;
+       }
 
 	return bp;
 }
@@ -312,6 +314,7 @@ libxfs_initbuf(xfs_buf_t *bp, dev_t device, xfs_daddr_t bno, unsigned int bytes)
 	bp->b_blkno = bno;
 	bp->b_bcount = bytes;
 	bp->b_dev = device;
+	bp->b_error = 0;
 	if (!bp->b_addr)
 		bp->b_addr = memalign(libxfs_device_alignment(), bytes);
 	if (!bp->b_addr) {
@@ -362,7 +365,7 @@ libxfs_getbufr(dev_t device, xfs_daddr_t blkno, int bblen)
 		libxfs_initbuf(bp, device, blkno, blen);
 #ifdef IO_DEBUG
 	printf("%lx: %s: allocated %u bytes buffer, key=%llu(%llu), %p\n",
-		pthread_self(), __FUNCTION__, BBTOB(len),
+		pthread_self(), __FUNCTION__, blen,
 		(long long)LIBXFS_BBTOOFF64(blkno), (long long)blkno, bp);
 #endif
 
@@ -452,15 +455,25 @@ libxfs_readbufr(dev_t dev, xfs_daddr_t blkno, xfs_buf_t *bp, int len, int flags)
 {
 	int	fd = libxfs_device_to_fd(dev);
 	int	bytes = BBTOB(len);
+	int	error;
+	int	sts;
 
 	ASSERT(BBTOB(len) <= bp->b_bcount);
 
-	if (pread64(fd, bp->b_addr, bytes, LIBXFS_BBTOOFF64(blkno)) < 0) {
+	sts = pread64(fd, bp->b_addr, bytes, LIBXFS_BBTOOFF64(blkno));
+	if (sts < 0) {
+		error = errno;
 		fprintf(stderr, _("%s: read failed: %s\n"),
-			progname, strerror(errno));
+			progname, strerror(error));
 		if (flags & LIBXFS_EXIT_ON_FAILURE)
 			exit(1);
-		return errno;
+		return error;
+	} else if (sts != bytes) {
+		fprintf(stderr, _("%s: error - read only %d of %d bytes\n"),
+			progname, sts, bytes);
+		if (flags & LIBXFS_EXIT_ON_FAILURE)
+			exit(1);
+		return EIO;
 	}
 #ifdef IO_DEBUG
 	printf("%lx: %s: read %u bytes, blkno=%llu(%llu), %p\n",
@@ -483,10 +496,8 @@ libxfs_readbuf(dev_t dev, xfs_daddr_t blkno, int len, int flags)
 	bp = libxfs_getbuf(dev, blkno, len);
 	if (bp && !(bp->b_flags & (LIBXFS_B_UPTODATE|LIBXFS_B_DIRTY))) {
 		error = libxfs_readbufr(dev, blkno, bp, len, flags);
-		if (error) {
-			libxfs_putbuf(bp);
-			return NULL;
-		}
+		if (error)
+			bp->b_error = error;
 	}
 	return bp;
 }
@@ -496,16 +507,17 @@ libxfs_writebufr(xfs_buf_t *bp)
 {
 	int	sts;
 	int	fd = libxfs_device_to_fd(bp->b_dev);
+	int	error;
 
 	sts = pwrite64(fd, bp->b_addr, bp->b_bcount, LIBXFS_BBTOOFF64(bp->b_blkno));
 	if (sts < 0) {
+		error = errno;
 		fprintf(stderr, _("%s: pwrite64 failed: %s\n"),
-			progname, strerror(errno));
+			progname, strerror(error));
 		if (bp->b_flags & LIBXFS_B_EXIT)
 			exit(1);
-		return errno;
-	}
-	else if (sts != bp->b_bcount) {
+		return error;
+	} else if (sts != bp->b_bcount) {
 		fprintf(stderr, _("%s: error - wrote only %d of %d bytes\n"),
 			progname, sts, bp->b_bcount);
 		if (bp->b_flags & LIBXFS_B_EXIT)

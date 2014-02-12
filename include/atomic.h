@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000,2005 Silicon Graphics, Inc.
+ * Copyright (c) 2011 RedHat, Inc.
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -15,24 +15,23 @@
  * along with this program; if not, write the Free Software Foundation,
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
-#ifndef __XFS_IMAP_H__
-#define	__XFS_IMAP_H__
+#ifndef __ATOMIC_H__
+#define __ATOMIC_H__
 
 /*
- * This is the structure passed to xfs_imap() to map
- * an inode number to its on disk location.
+ * Warning: These are not really atomic at all. They are wrappers around the
+ * kernel atomic variable interface. If we do need these variables to be atomic
+ * (due to multithreading of the code that uses them) we need to add some
+ * pthreads magic here.
  */
-typedef struct xfs_imap {
-	xfs_daddr_t	im_blkno;	/* starting BB of inode chunk */
-	uint		im_len;		/* length in BBs of inode chunk */
-	xfs_agblock_t	im_agblkno;	/* logical block of inode chunk in ag */
-	ushort		im_ioffset;	/* inode offset in block in "inodes" */
-	ushort		im_boffset;	/* inode offset in block in bytes */
-} xfs_imap_t;
+typedef	int32_t	atomic_t;
+typedef	int64_t	atomic64_t;
 
-struct xfs_mount;
-struct xfs_trans;
-int	xfs_imap(struct xfs_mount *, struct xfs_trans *, xfs_ino_t,
-		 xfs_imap_t *, uint);
+#define atomic_inc_return(x)	(++(*(x)))
+#define atomic_dec_return(x)	(--(*(x)))
 
-#endif	/* __XFS_IMAP_H__ */
+#define atomic64_read(x)	*(x)
+#define atomic64_set(x, v)	(*(x) = v)
+
+#endif /* __ATOMIC_H__ */
+

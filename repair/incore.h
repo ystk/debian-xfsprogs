@@ -307,21 +307,33 @@ void		free_inode_rec(xfs_agnumber_t agno, ino_tree_node_t *ino_rec);
 /*
  * get pulls the inode record from the good inode tree
  */
-void		get_inode_rec(xfs_agnumber_t agno, ino_tree_node_t *ino_rec);
+void		get_inode_rec(struct xfs_mount *mp, xfs_agnumber_t agno,
+			      ino_tree_node_t *ino_rec);
 
 extern avltree_desc_t     **inode_tree_ptrs;
+
+static inline int
+get_inode_offset(struct xfs_mount *mp, xfs_ino_t ino, ino_tree_node_t *irec)
+{
+	return XFS_INO_TO_AGINO(mp, ino) - irec->ino_startnum;
+}
 static inline ino_tree_node_t *
 findfirst_inode_rec(xfs_agnumber_t agno)
 {
 	return((ino_tree_node_t *) inode_tree_ptrs[agno]->avl_firstino);
 }
 static inline ino_tree_node_t *
-find_inode_rec(xfs_agnumber_t agno, xfs_agino_t ino)
+find_inode_rec(struct xfs_mount *mp, xfs_agnumber_t agno, xfs_agino_t ino)
 {
+	/*
+	 * Is the AG inside the file system
+	 */
+	if (agno >= mp->m_sb.sb_agcount)
+		return NULL;
 	return((ino_tree_node_t *)
 		avl_findrange(inode_tree_ptrs[agno], ino));
 }
-void		find_inode_rec_range(xfs_agnumber_t agno,
+void		find_inode_rec_range(struct xfs_mount *mp, xfs_agnumber_t agno,
 			xfs_agino_t start_ino, xfs_agino_t end_ino,
 			ino_tree_node_t **first, ino_tree_node_t **last);
 
@@ -330,8 +342,10 @@ void		find_inode_rec_range(xfs_agnumber_t agno,
  * automatically marks it as "existing".  Note -- all the inode
  * add/set/get routines assume a valid inode number.
  */
-ino_tree_node_t	*set_inode_used_alloc(xfs_agnumber_t agno, xfs_agino_t ino);
-ino_tree_node_t	*set_inode_free_alloc(xfs_agnumber_t agno, xfs_agino_t ino);
+ino_tree_node_t	*set_inode_used_alloc(struct xfs_mount *mp, xfs_agnumber_t agno,
+				      xfs_agino_t ino);
+ino_tree_node_t	*set_inode_free_alloc(struct xfs_mount *mp, xfs_agnumber_t agno,
+				      xfs_agino_t ino);
 
 void		print_inode_list(xfs_agnumber_t agno);
 void		print_uncertain_inode_list(xfs_agnumber_t agno);
@@ -346,7 +360,8 @@ void			add_inode_uncertain(xfs_mount_t *mp,
 						xfs_ino_t ino, int free);
 void			add_aginode_uncertain(xfs_agnumber_t agno,
 						xfs_agino_t agino, int free);
-void			get_uncertain_inode_rec(xfs_agnumber_t agno,
+void			get_uncertain_inode_rec(struct xfs_mount *mp,
+						xfs_agnumber_t agno,
 						ino_tree_node_t *ino_rec);
 void			clear_uncertain_ino_cache(xfs_agnumber_t agno);
 
@@ -440,6 +455,9 @@ void			clear_uncertain_ino_cache(xfs_agnumber_t agno);
 #define set_inode_used(ino_rec, ino_offset) \
 	XFS_INOCF_SET_CF((ino_rec), (ino_offset)), \
 	XFS_INOBT_CLR_FREE((ino_rec), (ino_offset))
+
+#define XFS_INOBT_IS_FREE(ino_rec, ino_offset) \
+	(((ino_rec)->ir_free & XFS_INOBT_MASK(ino_offset)) != 0)
 
 #define is_inode_used(ino_rec, ino_offset)	\
 	!XFS_INOBT_IS_FREE((ino_rec), (ino_offset))

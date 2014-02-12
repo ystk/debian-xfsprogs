@@ -33,7 +33,7 @@
 #define	rounddown(x, y)	(((x)/(y))*(y))
 
 extern void	phase1(xfs_mount_t *);
-extern void	phase2(xfs_mount_t *);
+extern void	phase2(xfs_mount_t *, int);
 extern void	phase3(xfs_mount_t *);
 extern void	phase4(xfs_mount_t *);
 extern void	phase5(xfs_mount_t *);
@@ -63,6 +63,8 @@ char *o_opts[] = {
 	"ag_stride",
 #define FORCE_GEO	5
 	"force_geometry",
+#define PHASE2_THREADS	6
+	"phase2_threads",
 	NULL
 };
 
@@ -80,6 +82,7 @@ char *c_opts[] = {
 static int	ihash_option_used;
 static int	bhash_option_used;
 static long	max_mem_specified;	/* in megabytes */
+static int	phase2_threads = 32;
 
 static void
 usage(void)
@@ -266,6 +269,9 @@ process_args(int argc, char **argv)
 						respec('o', o_opts, FORCE_GEO);
 					force_geo = 1;
 					break;
+				case PHASE2_THREADS:
+					phase2_threads = (int)strtol(val, NULL, 0);
+					break;
 				default:
 					unknown('o', val);
 					break;
@@ -451,18 +457,18 @@ calc_mkfs(xfs_mount_t *mp)
 	 */
 	if (mp->m_sb.sb_rootino != first_prealloc_ino)  {
 		do_warn(
-_("sb root inode value %llu %sinconsistent with calculated value %lu\n"),
+_("sb root inode value %" PRIu64 " %sinconsistent with calculated value %u\n"),
 			mp->m_sb.sb_rootino,
 			(mp->m_sb.sb_rootino == NULLFSINO ? "(NULLFSINO) ":""),
 			first_prealloc_ino);
 
 		if (!no_modify)
 			do_warn(
-		_("resetting superblock root inode pointer to %lu\n"),
+		_("resetting superblock root inode pointer to %u\n"),
 				first_prealloc_ino);
 		else
 			do_warn(
-		_("would reset superblock root inode pointer to %lu\n"),
+		_("would reset superblock root inode pointer to %u\n"),
 				first_prealloc_ino);
 
 		/*
@@ -474,18 +480,18 @@ _("sb root inode value %llu %sinconsistent with calculated value %lu\n"),
 
 	if (mp->m_sb.sb_rbmino != first_prealloc_ino + 1)  {
 		do_warn(
-_("sb realtime bitmap inode %llu %sinconsistent with calculated value %lu\n"),
+_("sb realtime bitmap inode %" PRIu64 " %sinconsistent with calculated value %u\n"),
 			mp->m_sb.sb_rbmino,
 			(mp->m_sb.sb_rbmino == NULLFSINO ? "(NULLFSINO) ":""),
 			first_prealloc_ino + 1);
 
 		if (!no_modify)
 			do_warn(
-		_("resetting superblock realtime bitmap ino pointer to %lu\n"),
+		_("resetting superblock realtime bitmap ino pointer to %u\n"),
 				first_prealloc_ino + 1);
 		else
 			do_warn(
-		_("would reset superblock realtime bitmap ino pointer to %lu\n"),
+		_("would reset superblock realtime bitmap ino pointer to %u\n"),
 				first_prealloc_ino + 1);
 
 		/*
@@ -497,18 +503,18 @@ _("sb realtime bitmap inode %llu %sinconsistent with calculated value %lu\n"),
 
 	if (mp->m_sb.sb_rsumino != first_prealloc_ino + 2)  {
 		do_warn(
-_("sb realtime summary inode %llu %sinconsistent with calculated value %lu\n"),
-		mp->m_sb.sb_rsumino,
-		(mp->m_sb.sb_rsumino == NULLFSINO ? "(NULLFSINO) ":""),
-		first_prealloc_ino + 2);
+_("sb realtime summary inode %" PRIu64 " %sinconsistent with calculated value %u\n"),
+			mp->m_sb.sb_rsumino,
+			(mp->m_sb.sb_rsumino == NULLFSINO ? "(NULLFSINO) ":""),
+			first_prealloc_ino + 2);
 
 		if (!no_modify)
 			do_warn(
-		_("resetting superblock realtime summary ino pointer to %lu\n"),
+		_("resetting superblock realtime summary ino pointer to %u\n"),
 				first_prealloc_ino + 2);
 		else
 			do_warn(
-		_("would reset superblock realtime summary ino pointer to %lu\n"),
+		_("would reset superblock realtime summary ino pointer to %u\n"),
 				first_prealloc_ino + 2);
 
 		/*
@@ -563,6 +569,35 @@ main(int argc, char **argv)
 	memset(&xfs_m, 0, sizeof(xfs_mount_t));
 	libxfs_sb_from_disk(&xfs_m.m_sb, XFS_BUF_TO_SBP(sbp));
 
+	/*
+	 * if the sector size of the filesystem we are trying to repair is
+	 * smaller than that of the underlying filesystem (i.e. we are repairing
+	 * an image), the we have to turn off direct IO because we cannot do IO
+	 * smaller than the host filesystem's sector size.
+	 */
+	if (isa_file) {
+		int     fd = libxfs_device_to_fd(x.ddev);
+		struct xfs_fsop_geom_v1 geom = { 0 };
+
+		if (ioctl(fd, XFS_IOC_FSGEOMETRY_V1, &geom) < 0) {
+			do_warn(_("Cannot get host filesystem geometry.\n"
+		"Repair may fail if there is a sector size mismatch between\n"
+		"the image and the host filesystem.\n"));
+			geom.sectsize = BBSIZE;
+		}
+
+		if (xfs_m.m_sb.sb_sectsize < geom.sectsize) {
+			long	old_flags;
+
+			old_flags = fcntl(fd, F_GETFL, 0);
+			if (fcntl(fd, F_SETFL, old_flags & ~O_DIRECT) < 0) {
+				do_warn(_(
+		"Sector size on host filesystem larger than image sector size.\n"
+		"Cannot turn off direct IO, so exiting.\n"));
+				exit(1);
+			}
+		}
+	}
 	mp = libxfs_mount(&xfs_m, &xfs_m.m_sb, x.ddev, x.logdev, x.rtdev, 0);
 
 	if (!mp)  {
@@ -638,8 +673,8 @@ main(int argc, char **argv)
 			max_mem = MIN(max_mem, (LONG_MAX >> 10) + 1);
 
 		if (verbose > 1)
-			do_log(_("        - max_mem = %lu, icount = %llu, "
-				"imem = %llu, dblock = %llu, dmem = %llu\n"),
+			do_log(
+	_("        - max_mem = %lu, icount = %" PRIu64 ", imem = %" PRIu64 ", dblock = %" PRIu64 ", dmem = %" PRIu64 "\n"),
 				max_mem, mp->m_sb.sb_icount,
 				mp->m_sb.sb_icount >> (10 - 2),
 				mp->m_sb.sb_dblocks,
@@ -650,12 +685,18 @@ main(int argc, char **argv)
 			 * Turn off prefetch and minimise libxfs cache if
 			 * physical memory is deemed insufficient
 			 */
-			if (max_mem_specified)
-				do_abort(_("Required memory for repair is "
-					"greater that the maximum specified "
-					"with the -m option. Please increase "
-					"it to at least %lu.\n"),
+			if (max_mem_specified) {
+				do_abort(
+	_("Required memory for repair is greater that the maximum specified\n"
+	  "with the -m option. Please increase it to at least %lu.\n"),
 					mem_used / 1024);
+			} else {
+				do_warn(
+	_("Not enough RAM available for repair to enable prefetching.\n"
+	  "This will be _slow_.\n"
+	  "You need at least %luMB RAM to run with prefetching enabled.\n"),
+					mem_used * 1280 / (1024 * 1024));
+			}
 			do_prefetch = 0;
 			libxfs_bhash_size = 64;
 		} else {
@@ -703,7 +744,7 @@ main(int argc, char **argv)
 	}
 
 	/* make sure the per-ag freespace maps are ok so we can mount the fs */
-	phase2(mp);
+	phase2(mp, phase2_threads);
 	timestamp(PHASE_END, 2, NULL);
 
 	if (do_prefetch)

@@ -56,7 +56,7 @@ walk_unlinked_list(xfs_mount_t *mp, xfs_agnumber_t agno, xfs_agino_t start_ino)
 			 * inode.  if so, put it on the uncertain inode list
 			 * and set block map appropriately.
 			 */
-			if (find_inode_rec(agno, current_ino) == NULL)  {
+			if (find_inode_rec(mp, agno, current_ino) == NULL)  {
 				add_aginode_uncertain(agno, current_ino, 1);
 				agbno = XFS_AGINO_TO_AGBNO(mp, current_ino);
 
@@ -107,7 +107,7 @@ process_agi_unlinked(xfs_mount_t *mp, xfs_agnumber_t agno)
 			XFS_AG_DADDR(mp, agno, XFS_AGI_DADDR(mp)),
 			mp->m_sb.sb_sectsize/BBSIZE, 0);
 	if (!bp)
-		do_error(_("cannot read agi block %lld for ag %u\n"),
+		do_error(_("cannot read agi block %" PRId64 " for ag %u\n"),
 			XFS_AG_DADDR(mp, agno, XFS_AGI_DADDR(mp)), agno);
 
 	agip = XFS_BUF_TO_AGI(bp);
