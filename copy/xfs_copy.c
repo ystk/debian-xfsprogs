@@ -217,28 +217,9 @@ handle_error:
 }
 
 void
-killall(void)
-{
-	int i;
-
-	/* only the parent gets to kill things */
-
-	if (getpid() != parent_pid)
-		return;
-
-	for (i = 0; i < num_targets; i++)  {
-		if (target[i].state == ACTIVE)  {
-			/* kill up target threads */
-			pthread_kill(target[i].pid, SIGKILL);
-			pthread_mutex_unlock(&targ[i].wait);
-		}
-	}
-}
-
-void
 handler(int sig)
 {
-	pid_t	pid = getpid();
+	pid_t	pid;
 	int	status, i;
 
 	pid = wait(&status);
@@ -301,7 +282,7 @@ void
 usage(void)
 {
 	fprintf(stderr,
-		_("Usage: %s [-bd] [-L logfile] source target [target ...]\n"),
+		_("Usage: %s [-bdV] [-L logfile] source target [target ...]\n"),
 		progname);
 	exit(1);
 }
@@ -400,8 +381,7 @@ read_wbuf(int fd, wbuf *buf, xfs_mount_t *mp)
 	if (buf->length > buf->size)  {
 		do_warn(_("assert error:  buf->length = %d, buf->size = %d\n"),
 			buf->length, buf->size);
-		killall();
-		abort();
+		exit(1);
 	}
 
 	if ((res = read(fd, buf->data, buf->length)) < 0)  {
@@ -434,6 +414,10 @@ read_ag_header(int fd, xfs_agnumber_t agno, wbuf *buf, ag_header_t *ag,
 	off = XFS_AG_DADDR(mp, agno, XFS_SB_DADDR);
 	buf->position = (xfs_off_t) off * (xfs_off_t) BBSIZE;
 	length = buf->length = first_agbno * blocksize;
+	if (length == 0) {
+		do_log(_("ag header buffer invalid!\n"));
+		exit(1);
+	}
 
 	/* handle alignment stuff */
 
@@ -449,7 +433,6 @@ read_ag_header(int fd, xfs_agnumber_t agno, wbuf *buf, ag_header_t *ag,
 	if (buf->length % buf->min_io_size != 0)
 		buf->length = roundup(buf->length, buf->min_io_size);
 
-	ASSERT(length != 0);
 	read_wbuf(fd, buf, mp);
 	ASSERT(buf->length >= length);
 
@@ -591,11 +574,6 @@ main(int argc, char **argv)
 
 	parent_pid = getpid();
 
-	if (atexit(killall))  {
-		do_log(_("%s: couldn't register atexit function.\n"), progname);
-		die_perror();
-	}
-
 	/* open up source -- is it a file? */
 
 	open_flags = O_RDONLY;
@@ -674,12 +652,24 @@ main(int argc, char **argv)
 
 	/* prepare the mount structure */
 
-	sbp = libxfs_readbuf(xargs.ddev, XFS_SB_DADDR, 1, 0);
 	memset(&mbuf, 0, sizeof(xfs_mount_t));
+	libxfs_buftarg_init(&mbuf, xargs.ddev, xargs.logdev, xargs.rtdev);
+	sbp = libxfs_readbuf(mbuf.m_ddev_targp, XFS_SB_DADDR, 1, 0,
+							&xfs_sb_buf_ops);
 	sb = &mbuf.m_sb;
 	libxfs_sb_from_disk(sb, XFS_BUF_TO_SBP(sbp));
 
-	mp = libxfs_mount(&mbuf, sb, xargs.ddev, xargs.logdev, xargs.rtdev, 1);
+	/*
+	 * For now, V5 superblock filesystems are not supported without -d;
+	 * we do not have the infrastructure yet to fix CRCs when a new UUID
+	 * is generated.
+	 */
+	if (xfs_sb_version_hascrc(sb) && !duplicate) {
+		do_log(_("%s: Cannot yet copy V5 fs without '-d'\n"), progname);
+		exit(1);
+	}
+
+	mp = libxfs_mount(&mbuf, sb, xargs.ddev, xargs.logdev, xargs.rtdev, 0);
 	if (mp == NULL) {
 		do_log(_("%s: %s filesystem failed to initialize\n"
 			"%s: Aborting.\n"), progname, source_name, progname);
@@ -710,7 +700,7 @@ main(int argc, char **argv)
 	if (source_blocksize > source_sectorsize)  {
 		/* get number of leftover sectors in last block of ag header */
 
-		tmp_residue = ((XFS_AGFL_DADDR(mp) + 1) * source_sectorsize)
+		tmp_residue = ((XFS_AGFL_DADDR(mp) + 1) * BBSIZE)
 					% source_blocksize;
 		first_residue = (tmp_residue == 0) ? 0 :
 			source_blocksize - tmp_residue;
@@ -723,10 +713,10 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	first_agbno = (((XFS_AGFL_DADDR(mp) + 1) * source_sectorsize)
+	first_agbno = (((XFS_AGFL_DADDR(mp) + 1) * BBSIZE)
 				+ first_residue) / source_blocksize;
 	ASSERT(first_agbno != 0);
-	ASSERT( ((((XFS_AGFL_DADDR(mp) + 1) * source_sectorsize)
+	ASSERT(((((XFS_AGFL_DADDR(mp) + 1) * BBSIZE)
 				+ first_residue) % source_blocksize) == 0);
 
 	/* now open targets */
@@ -897,7 +887,6 @@ main(int argc, char **argv)
 			    - (__uint64_t)mp->m_sb.sb_fdblocks + 10 * num_ags));
 
 	kids = num_targets;
-	block = (struct xfs_btree_block *) btree_buf.data;
 
 	for (agno = 0; agno < num_ags && kids > 0; agno++)  {
 		/* read in first blocks of the ag */
@@ -934,7 +923,12 @@ main(int argc, char **argv)
 		for (;;) {
 			/* none of this touches the w_buf buffer */
 
-			ASSERT(current_level < btree_levels);
+			if (current_level >= btree_levels) {
+				do_log(
+			_("Error: current level %d >= btree levels %d\n"),
+					current_level, btree_levels);
+				exit(1);
+			}
 
 			current_level++;
 
@@ -947,7 +941,13 @@ main(int argc, char **argv)
 				 ((char *)btree_buf.data +
 				  pos - btree_buf.position);
 
-			ASSERT(be32_to_cpu(block->bb_magic) == XFS_ABTB_MAGIC);
+			if (be32_to_cpu(block->bb_magic) !=
+			    (xfs_sb_version_hascrc(&mp->m_sb) ?
+			     XFS_ABTB_CRC_MAGIC : XFS_ABTB_MAGIC)) {
+				do_log(_("Bad btree magic 0x%x\n"),
+				        be32_to_cpu(block->bb_magic));
+				exit(1);
+			}
 
 			if (be16_to_cpu(block->bb_level) == 0)
 				break;
@@ -1152,9 +1152,6 @@ main(int argc, char **argv)
 	}
 
 	check_errors();
-	killall();
-	pthread_exit(NULL);
-	/*NOTREACHED*/
 	return 0;
 }
 

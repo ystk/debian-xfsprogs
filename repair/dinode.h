@@ -18,9 +18,8 @@
 #ifndef _XR_DINODE_H
 #define _XR_DINODE_H
 
-#include "prefetch.h"
-
 struct blkmap;
+struct prefetch_args;
 
 int
 verify_agbno(xfs_mount_t	*mp,
@@ -42,7 +41,7 @@ convert_extent(
 int
 process_bmbt_reclist(xfs_mount_t	*mp,
 		xfs_bmbt_rec_t		*rp,
-		int			numrecs,
+		int			*numrecs,
 		int			type,
 		xfs_ino_t		ino,
 		xfs_drfsbno_t		*tot,
@@ -55,24 +54,11 @@ int
 scan_bmbt_reclist(
 	xfs_mount_t		*mp,
 	xfs_bmbt_rec_t		*rp,
-	int			numrecs,
+	int			*numrecs,
 	int			type,
 	xfs_ino_t		ino,
 	xfs_drfsbno_t		*tot,
 	int			whichfork);
-
-int
-verify_inode_chunk(xfs_mount_t		*mp,
-			xfs_ino_t	ino,
-			xfs_ino_t	*start_ino);
-
-int	verify_aginode_chunk(xfs_mount_t	*mp,
-				xfs_agnumber_t	agno,
-				xfs_agino_t	agino,
-				xfs_agino_t	*agino_start);
-
-int
-clear_dinode(xfs_mount_t *mp, xfs_dinode_t *dino, xfs_ino_t ino_num);
 
 void
 update_rootino(xfs_mount_t *mp);
@@ -116,12 +102,12 @@ int
 process_uncertain_aginodes(xfs_mount_t		*mp,
 				xfs_agnumber_t	agno);
 void
-process_aginodes(xfs_mount_t	*mp,
-		prefetch_args_t	*pf_args,
-		xfs_agnumber_t	agno,
-		int		check_dirs,
-		int		check_dups,
-		int		extra_attr_check);
+process_aginodes(xfs_mount_t		*mp,
+		struct prefetch_args	*pf_args,
+		xfs_agnumber_t		agno,
+		int			check_dirs,
+		int			check_dups,
+		int			extra_attr_check);
 
 void
 check_uncertain_aginodes(xfs_mount_t	*mp,
@@ -133,11 +119,8 @@ get_agino_buf(xfs_mount_t	*mp,
 		xfs_agino_t	agino,
 		xfs_dinode_t	**dipp);
 
-xfs_dfsbno_t
-get_bmapi(xfs_mount_t		*mp,
-		xfs_dinode_t	*dip,
-		xfs_ino_t	ino_num,
-		xfs_dfiloff_t	bno,
-		int             whichfork );
+
+void dinode_bmbt_translation_init(void);
+char * get_forkname(int whichfork);
 
 #endif /* _XR_DINODE_H */

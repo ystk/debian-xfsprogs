@@ -47,16 +47,16 @@ blkmap_alloc(
 	if (nex < 1)
 		nex = 1;
 
+#if (BITS_PER_LONG == 32)	/* on 64-bit platforms this is never true */
 	if (nex > BLKMAP_NEXTS_MAX) {
-#if (BITS_PER_LONG == 32)
 		do_warn(
 	_("Number of extents requested in blkmap_alloc (%d) overflows 32 bits.\n"
 	  "If this is not a corruption, then you will need a 64 bit system\n"
 	  "to repair this filesystem.\n"),
 			nex);
-#endif
 		return NULL;
 	}
+#endif
 
 	key = whichfork ? ablkmap_key : dblkmap_key;
 	blkmap = pthread_getspecific(key);
@@ -168,7 +168,8 @@ blkmap_getn(
 		/*
 		 * rare case - multiple extents for a single dir block
 		 */
-		bmp = malloc(nb * sizeof(bmap_ext_t));
+		if (!bmp)
+			bmp = malloc(nb * sizeof(bmap_ext_t));
 		if (!bmp)
 			do_error(_("blkmap_getn malloc failed (%" PRIu64 " bytes)\n"),
 						nb * sizeof(bmap_ext_t));
@@ -205,8 +206,25 @@ blkmap_last_off(
 	return ext->startoff + ext->blockcount;
 }
 
-/*
- * Return the next offset in a block map.
+/**
+ * blkmap_next_off - Return next logical block offset in a block map.
+ * @blkmap:	blockmap to use
+ * @o:		current file logical block number
+ * @t:		current extent index into blockmap (in/out)
+ *
+ * Given a logical block offset in a file, return the next mapped logical offset
+ * The map index "t" tracks the current extent number in the block map, and
+ * is updated automatically if the returned offset resides within the next
+ * mapped extent.
+ *
+ * If the blockmap contains no extents, or no more logical offsets are mapped,
+ * or the extent index exceeds the number of extents in the map,
+ * return NULLDFILOFF.
+ *
+ * If offset o is beyond extent index t, the first offset in the next extent
+ * after extent t will be returned.
+ *
+ * Intended to be called starting with offset 0, index 0, and iterated.
  */
 xfs_dfiloff_t
 blkmap_next_off(
@@ -222,10 +240,12 @@ blkmap_next_off(
 		*t = 0;
 		return blkmap->exts[0].startoff;
 	}
+	if (*t >= blkmap->nexts)
+		return NULLDFILOFF;
 	ext = blkmap->exts + *t;
 	if (o < ext->startoff + ext->blockcount - 1)
 		return o + 1;
-	if (*t >= blkmap->nexts - 1)
+	if (*t == blkmap->nexts - 1)
 		return NULLDFILOFF;
 	(*t)++;
 	return ext[1].startoff;
@@ -240,22 +260,30 @@ blkmap_grow(
 {
 	pthread_key_t	key = dblkmap_key;
 	blkmap_t	*new_blkmap;
-	int		new_naexts = blkmap->naexts + 4;
+	int		new_naexts;
+
+	/* reduce the number of reallocations for large files */
+	if (blkmap->naexts < 1000)
+		new_naexts = blkmap->naexts + 4;
+	else if (blkmap->naexts < 10000)
+		new_naexts = blkmap->naexts + 100;
+	else
+		new_naexts = blkmap->naexts + 1000;
 
 	if (pthread_getspecific(key) != blkmap) {
 		key = ablkmap_key;
 		ASSERT(pthread_getspecific(key) == blkmap);
 	}
 
+#if (BITS_PER_LONG == 32)	/* on 64-bit platforms this is never true */
 	if (new_naexts > BLKMAP_NEXTS_MAX) {
-#if (BITS_PER_LONG == 32)
 		do_error(
 	_("Number of extents requested in blkmap_grow (%d) overflows 32 bits.\n"
 	  "You need a 64 bit system to repair this filesystem.\n"),
 			new_naexts);
-#endif
 		return NULL;
 	}
+#endif
 	if (new_naexts <= 0) {
 		do_error(
 	_("Number of extents requested in blkmap_grow (%d) overflowed the\n"
@@ -298,15 +326,33 @@ blkmap_set_ext(
 	}
 
 	ASSERT(blkmap->nexts < blkmap->naexts);
-	for (i = 0; i < blkmap->nexts; i++) {
-		if (blkmap->exts[i].startoff > o) {
-			memmove(blkmap->exts + i + 1,
-				blkmap->exts + i,
-				sizeof(bmap_ext_t) * (blkmap->nexts - i));
-			break;
-		}
+
+	if (blkmap->nexts == 0) {
+		i = 0;
+		goto insert;
 	}
 
+	/*
+	 * The most common insert pattern comes from an ascending offset order
+	 * bmapbt scan. In this case, the extent being added will end up at the
+	 * end of the array. Hence do a reverse order search for the insertion
+	 * point so we don't needlessly scan the entire array on every
+	 * insertion.
+	 *
+	 * Also, use "plus 1" indexing for the loop counter so when we break out
+	 * of the loop we are at the correct index for insertion.
+	 */
+	for (i = blkmap->nexts; i > 0; i--) {
+		if (blkmap->exts[i - 1].startoff < o)
+			break;
+	}
+
+	/* make space for the new extent */
+	memmove(blkmap->exts + i + 1,
+		blkmap->exts + i,
+		sizeof(bmap_ext_t) * (blkmap->nexts - i));
+
+insert:
 	blkmap->exts[i].startoff = o;
 	blkmap->exts[i].startblock = b;
 	blkmap->exts[i].blockcount = c;

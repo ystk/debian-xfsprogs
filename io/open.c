@@ -22,10 +22,25 @@
 #include "init.h"
 #include "io.h"
 
+#ifndef __O_TMPFILE
+#if defined __alpha__
+#define __O_TMPFILE	0100000000
+#elif defined(__hppa__)
+#define __O_TMPFILE	 040000000
+#elif defined(__sparc__)
+#define __O_TMPFILE	 0x2000000
+#else
+#define __O_TMPFILE	 020000000
+#endif
+#endif /* __O_TMPFILE */
+
+#ifndef O_TMPFILE
+#define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
+#endif
+
 static cmdinfo_t open_cmd;
 static cmdinfo_t stat_cmd;
 static cmdinfo_t close_cmd;
-static cmdinfo_t setfl_cmd;
 static cmdinfo_t statfs_cmd;
 static cmdinfo_t chproj_cmd;
 static cmdinfo_t lsproj_cmd;
@@ -78,13 +93,14 @@ stat_f(
 	int		verbose = (argc == 2 && !strcmp(argv[1], "-v"));
 
 	printf(_("fd.path = \"%s\"\n"), file->name);
-	printf(_("fd.flags = %s,%s,%s%s%s%s\n"),
+	printf(_("fd.flags = %s,%s,%s%s%s%s%s\n"),
 		file->flags & IO_OSYNC ? _("sync") : _("non-sync"),
 		file->flags & IO_DIRECT ? _("direct") : _("non-direct"),
 		file->flags & IO_READONLY ? _("read-only") : _("read-write"),
 		file->flags & IO_REALTIME ? _(",real-time") : "",
 		file->flags & IO_APPEND ? _(",append-only") : "",
-		file->flags & IO_NONBLOCK ? _(",non-block") : "");
+		file->flags & IO_NONBLOCK ? _(",non-block") : "",
+		file->flags & IO_TMPFILE ? _(",tmpfile") : "");
 	if (fstat64(file->fd, &st) < 0) {
 		perror("fstat64");
 	} else {
@@ -144,10 +160,13 @@ openfile(
 		oflags |= O_TRUNC;
 	if (flags & IO_NONBLOCK)
 		oflags |= O_NONBLOCK;
+	if (flags & IO_TMPFILE)
+		oflags |= O_TMPFILE;
 
 	fd = open(path, oflags, mode);
 	if (fd < 0) {
-		if ((errno == EISDIR) && (oflags & O_RDWR)) {
+		if (errno == EISDIR &&
+		    ((oflags & (O_RDWR|O_TMPFILE)) == O_RDWR)) {
 			/* make it as if we asked for O_RDONLY & try again */
 			oflags &= ~O_RDWR;
 			oflags |= O_RDONLY;
@@ -163,16 +182,8 @@ openfile(
 		}
 	}
 
-	if (!geom)
+	if (!geom || !platform_test_xfs_fd(fd))
 		return fd;
-
-	if (!platform_test_xfs_fd(fd)) {
-		fprintf(stderr, _("%s: specified file "
-			"[\"%s\"] is not on an XFS filesystem\n"),
-			progname, path);
-		close(fd);
-		return -1;
-	}
 
 	if (xfsctl(path, fd, XFS_IOC_FSGEOMETRY, geom) < 0) {
 		perror("XFS_IOC_FSGEOMETRY");
@@ -248,7 +259,6 @@ open_help(void)
 "\n"
 " Opens a file for subsequent use by all of the other xfs_io commands.\n"
 " With no arguments, open uses the stat command to show the current file.\n"
-" -F -- foreign filesystem file, disallow XFS-specific commands\n"
 " -a -- open with the O_APPEND flag (append-only mode)\n"
 " -d -- open with O_DIRECT (non-buffered IO, note alignment constraints)\n"
 " -f -- open with O_CREAT (create the file if it doesn't exist)\n"
@@ -258,6 +268,7 @@ open_help(void)
 " -s -- open with O_SYNC\n"
 " -t -- open with O_TRUNC (truncate the file to zero length if it exists)\n"
 " -R -- mark the file as a realtime XFS file immediately after opening it\n"
+" -T -- open with O_TMPFILE (create a file not visible in the namespace)\n"
 " Note1: usually read/write direct IO requests must be blocksize aligned;\n"
 "        some kernels, however, allow sectorsize alignment for direct IO.\n"
 " Note2: the bmap for non-regular files can be obtained provided the file\n"
@@ -282,10 +293,10 @@ open_f(
 		return 0;
 	}
 
-	while ((c = getopt(argc, argv, "FRacdfm:nrstx")) != EOF) {
+	while ((c = getopt(argc, argv, "FRTacdfm:nrstx")) != EOF) {
 		switch (c) {
 		case 'F':
-			flags |= IO_FOREIGN;
+			/* Ignored / deprecated now, handled automatically */
 			break;
 		case 'a':
 			flags |= IO_APPEND;
@@ -320,6 +331,9 @@ open_f(
 		case 'x':	/* backwards compatibility */
 			flags |= IO_REALTIME;
 			break;
+		case 'T':
+			flags |= IO_TMPFILE;
+			break;
 		default:
 			return command_usage(&open_cmd);
 		}
@@ -328,10 +342,17 @@ open_f(
 	if (optind != argc - 1)
 		return command_usage(&open_cmd);
 
-	fd = openfile(argv[optind], flags & IO_FOREIGN ?
-					NULL : &geometry, flags, mode);
+	if ((flags & (IO_READONLY|IO_TMPFILE)) == (IO_READONLY|IO_TMPFILE)) {
+		fprintf(stderr, _("-T and -r options are incompatible\n"));
+		return -1;
+	}
+
+	fd = openfile(argv[optind], &geometry, flags, mode);
 	if (fd < 0)
 		return 0;
+
+	if (!platform_test_xfs_fd(fd))
+		flags |= IO_FOREIGN;
 
 	addfile(argv[optind], fd, &geometry, flags);
 	return 0;
@@ -675,45 +696,6 @@ extsize_f(
 }
 
 static int
-setfl_f(
-	int			argc,
-	char			**argv)
-{
-	int			c, flags;
-
-	flags = fcntl(file->fd, F_GETFL, 0);
-	if (flags < 0) {
-		perror("fcntl(F_GETFL)");
-		return 0;
-	}
-
-	while ((c = getopt(argc, argv, "ad")) != EOF) {
-		switch (c) {
-		case 'a':
-			if (flags & O_APPEND)
-				flags |= O_APPEND;
-			else
-				flags &= ~O_APPEND;
-			break;
-		case 'd':
-			if (flags & O_DIRECT)
-				flags |= O_DIRECT;
-			else
-				flags &= ~O_DIRECT;
-			break;
-		default:
-			printf(_("invalid setfl argument -- '%c'\n"), c);
-			return 0;
-		}
-	}
-
-	if (fcntl(file->fd, F_SETFL, flags)  < 0)
-		perror("fcntl(F_SETFL)");
-
-	return 0;
-}
-
-static int
 statfs_f(
 	int			argc,
 	char			**argv)
@@ -778,7 +760,7 @@ open_init(void)
 	open_cmd.argmin = 0;
 	open_cmd.argmax = -1;
 	open_cmd.flags = CMD_NOMAP_OK | CMD_NOFILE_OK | CMD_FOREIGN_OK;
-	open_cmd.args = _("[-acdrstx] [path]");
+	open_cmd.args = _("[-acdrstxT] [path]");
 	open_cmd.oneline = _("open the file specified by path");
 	open_cmd.help = open_help;
 
@@ -797,13 +779,6 @@ open_init(void)
 	close_cmd.argmax = 0;
 	close_cmd.flags = CMD_NOMAP_OK | CMD_FOREIGN_OK;
 	close_cmd.oneline = _("close the current open file");
-
-	setfl_cmd.name = "setfl";
-	setfl_cmd.cfunc = setfl_f;
-	setfl_cmd.args = _("[-adx]");
-	setfl_cmd.flags = CMD_NOMAP_OK | CMD_FOREIGN_OK;
-	setfl_cmd.oneline =
-		_("set/clear append/direct flags on the open file");
 
 	statfs_cmd.name = "statfs";
 	statfs_cmd.cfunc = statfs_f;
@@ -844,7 +819,6 @@ open_init(void)
 	add_command(&open_cmd);
 	add_command(&stat_cmd);
 	add_command(&close_cmd);
-	add_command(&setfl_cmd);
 	add_command(&statfs_cmd);
 	add_command(&chproj_cmd);
 	add_command(&lsproj_cmd);

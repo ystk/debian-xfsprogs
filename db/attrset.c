@@ -146,7 +146,7 @@ attr_set_f(
 			dbprintf(_("cannot allocate buffer (%d)\n"), valuelen);
 			goto out;
 		}
-		memset(value, 0xfeedface, valuelen);
+		memset(value, 'v', valuelen);
 	} else {
 		value = NULL;
 	}
@@ -170,7 +170,7 @@ attr_set_f(
 out:
 	mp->m_flags &= ~LIBXFS_MOUNT_COMPAT_ATTR;
 	if (ip)
-		libxfs_iput(ip, 0);
+		IRELE(ip);
 	if (value)
 		free(value);
 	return 0;
@@ -244,6 +244,6 @@ attr_remove_f(
 out:
 	mp->m_flags &= ~LIBXFS_MOUNT_COMPAT_ATTR;
 	if (ip)
-		libxfs_iput(ip, 0);
+		IRELE(ip);
 	return 0;
 }

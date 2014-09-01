@@ -22,6 +22,113 @@
 #include <stdarg.h>
 
 /*
+ * Calculate the worst case log unit reservation for a given superblock
+ * configuration. Copied and munged from the kernel code, and assumes a
+ * worse case header usage (maximum log buffer sizes)
+ */
+int
+xfs_log_calc_unit_res(
+	struct xfs_mount	*mp,
+	int			unit_bytes)
+{
+	int			iclog_space;
+	int			iclog_header_size;
+	int			iclog_size;
+	uint			num_headers;
+
+	if (xfs_sb_version_haslogv2(&mp->m_sb)) {
+		iclog_size = XLOG_MAX_RECORD_BSIZE;
+		iclog_header_size = BBTOB(iclog_size / XLOG_HEADER_CYCLE_SIZE);
+	} else {
+		iclog_size = XLOG_BIG_RECORD_BSIZE;
+		iclog_header_size = BBSIZE;
+	}
+
+	/*
+	 * Permanent reservations have up to 'cnt'-1 active log operations
+	 * in the log.  A unit in this case is the amount of space for one
+	 * of these log operations.  Normal reservations have a cnt of 1
+	 * and their unit amount is the total amount of space required.
+	 *
+	 * The following lines of code account for non-transaction data
+	 * which occupy space in the on-disk log.
+	 *
+	 * Normal form of a transaction is:
+	 * <oph><trans-hdr><start-oph><reg1-oph><reg1><reg2-oph>...<commit-oph>
+	 * and then there are LR hdrs, split-recs and roundoff at end of syncs.
+	 *
+	 * We need to account for all the leadup data and trailer data
+	 * around the transaction data.
+	 * And then we need to account for the worst case in terms of using
+	 * more space.
+	 * The worst case will happen if:
+	 * - the placement of the transaction happens to be such that the
+	 *   roundoff is at its maximum
+	 * - the transaction data is synced before the commit record is synced
+	 *   i.e. <transaction-data><roundoff> | <commit-rec><roundoff>
+	 *   Therefore the commit record is in its own Log Record.
+	 *   This can happen as the commit record is called with its
+	 *   own region to xlog_write().
+	 *   This then means that in the worst case, roundoff can happen for
+	 *   the commit-rec as well.
+	 *   The commit-rec is smaller than padding in this scenario and so it is
+	 *   not added separately.
+	 */
+
+	/* for trans header */
+	unit_bytes += sizeof(xlog_op_header_t);
+	unit_bytes += sizeof(xfs_trans_header_t);
+
+	/* for start-rec */
+	unit_bytes += sizeof(xlog_op_header_t);
+
+	/*
+	 * for LR headers - the space for data in an iclog is the size minus
+	 * the space used for the headers. If we use the iclog size, then we
+	 * undercalculate the number of headers required.
+	 *
+	 * Furthermore - the addition of op headers for split-recs might
+	 * increase the space required enough to require more log and op
+	 * headers, so take that into account too.
+	 *
+	 * IMPORTANT: This reservation makes the assumption that if this
+	 * transaction is the first in an iclog and hence has the LR headers
+	 * accounted to it, then the remaining space in the iclog is
+	 * exclusively for this transaction.  i.e. if the transaction is larger
+	 * than the iclog, it will be the only thing in that iclog.
+	 * Fundamentally, this means we must pass the entire log vector to
+	 * xlog_write to guarantee this.
+	 */
+	iclog_space = iclog_size - iclog_header_size;
+	num_headers = howmany(unit_bytes, iclog_space);
+
+	/* for split-recs - ophdrs added when data split over LRs */
+	unit_bytes += sizeof(xlog_op_header_t) * num_headers;
+
+	/* add extra header reservations if we overrun */
+	while (!num_headers ||
+	       howmany(unit_bytes, iclog_space) > num_headers) {
+		unit_bytes += sizeof(xlog_op_header_t);
+		num_headers++;
+	}
+	unit_bytes += iclog_header_size * num_headers;
+
+	/* for commit-rec LR header - note: padding will subsume the ophdr */
+	unit_bytes += iclog_header_size;
+
+	/* for roundoff padding for transaction data and one for commit record */
+	if (xfs_sb_version_haslogv2(&mp->m_sb) && mp->m_sb.sb_logsunit > 1) {
+		/* log su roundoff */
+		unit_bytes += 2 * mp->m_sb.sb_logsunit;
+	} else {
+		/* BB roundoff */
+		unit_bytes += 2 * BBSIZE;
+        }
+
+	return unit_bytes;
+}
+
+/*
  * Change the requested timestamp in the given inode.
  *
  * This was once shared with the kernel, but has diverged to the point
@@ -47,130 +154,10 @@ libxfs_trans_ichgtime(
 		ip->i_d.di_ctime.t_sec = (__int32_t)tv.tv_sec;
 		ip->i_d.di_ctime.t_nsec = (__int32_t)tv.tv_nsec;
 	}
-}
-
-/*
- * Given a mount structure and an inode number, return a pointer
- * to a newly allocated in-core inode coresponding to the given
- * inode number.
- *
- * Initialize the inode's attributes and extent pointers if it
- * already has them (it will not if the inode has no links).
- *
- * NOTE: this has slightly different behaviour to the kernel in
- * that this version requires the already allocated *ip being 
- * passed in while the kernel version does the allocation and 
- * returns it in **ip.
- */
-int
-libxfs_iread(
-	xfs_mount_t     *mp,
-	xfs_trans_t	*tp,
-	xfs_ino_t	ino,
-	xfs_inode_t	*ip,
-	xfs_daddr_t	bno)
-{
-	xfs_buf_t	*bp;
-	xfs_dinode_t	*dip;
-	int		error;
-
-	ip->i_ino = ino;
-	ip->i_mount = mp;
-
-        /*
-         * Fill in the location information in the in-core inode.
-         */
-        error = xfs_imap(mp, tp, ip->i_ino, &ip->i_imap, 0);
-        if (error)
-                return error;
-
-        /*
-         * Get pointers to the on-disk inode and the buffer containing it.
-         */
-        error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &bp, XBF_LOCK, 0);
-        if (error)
-                return error;
-        dip = (xfs_dinode_t *)xfs_buf_offset(bp, ip->i_imap.im_boffset);
-
-	/*
-	 * If we got something that isn't an inode it means someone
-	 * (nfs or dmi) has a stale handle.
-	 */
-	if (be16_to_cpu(dip->di_magic) != XFS_DINODE_MAGIC) {
-		xfs_trans_brelse(tp, bp);
-		return EINVAL;
+	if (flags & XFS_ICHGTIME_CREATE) {
+		ip->i_d.di_crtime.t_sec = (__int32_t)tv.tv_sec;
+		ip->i_d.di_crtime.t_nsec = (__int32_t)tv.tv_nsec;
 	}
-
-	/*
-	 * If the on-disk inode is already linked to a directory
-	 * entry, copy all of the inode into the in-core inode.
-	 * xfs_iformat() handles copying in the inode format
-	 * specific information.
-	 * Otherwise, just get the truly permanent information.
-	 */
-	if (dip->di_mode) {
-		xfs_dinode_from_disk(&ip->i_d, dip);
-		error = xfs_iformat(ip, dip);
-		if (error)  {
-			xfs_trans_brelse(tp, bp);
-			return error;
-		}
-	} else {
-		ip->i_d.di_magic = be16_to_cpu(dip->di_magic);
-		ip->i_d.di_version = dip->di_version;
-		ip->i_d.di_gen = be32_to_cpu(dip->di_gen);
-		ip->i_d.di_flushiter = be16_to_cpu(dip->di_flushiter);
-		/*
-		 * Make sure to pull in the mode here as well in
-		 * case the inode is released without being used.
-		 * This ensures that xfs_inactive() will see that
-		 * the inode is already free and not try to mess
-		 * with the uninitialized part of it.
-		 */
-		ip->i_d.di_mode = 0;
-		/*
-		 * Initialize the per-fork minima and maxima for a new
-		 * inode here.  xfs_iformat will do it for old inodes.
-		 */
-		ip->i_df.if_ext_max =
-			XFS_IFORK_DSIZE(ip) / (uint)sizeof(xfs_bmbt_rec_t);
-	}
-
-	/*
-	 * The inode format changed when we moved the link count and
-	 * made it 32 bits long.  If this is an old format inode,
-	 * convert it in memory to look like a new one.  If it gets
-	 * flushed to disk we will convert back before flushing or
-	 * logging it.  We zero out the new projid_lo/hi field and the old link
-	 * count field.  We'll handle clearing the pad field (the remains
-	 * of the old uuid field) when we actually convert the inode to
-	 * the new format. We don't change the version number so that we
-	 * can distinguish this from a real new format inode.
-	 */
-	if (ip->i_d.di_version == 1) {
-		ip->i_d.di_nlink = ip->i_d.di_onlink;
-		ip->i_d.di_onlink = 0;
-		xfs_set_projid(&ip->i_d, 0);
-	}
-
-	ip->i_delayed_blks = 0;
-	ip->i_size = ip->i_d.di_size;
-
-	/*
-	 * Use xfs_trans_brelse() to release the buffer containing the
-	 * on-disk inode, because it was acquired with xfs_trans_read_buf()
-	 * in xfs_itobp() above.  If tp is NULL, this is just a normal
-	 * brelse().  If we're within a transaction, then xfs_trans_brelse()
-	 * will only release the buffer if it is not dirty within the
-	 * transaction.  It will be OK to release the buffer in this case,
-	 * because inodes on disk are never destroyed and we will be
-	 * locking the new in-core inode before putting it in the hash
-	 * table where other processes can find it.  Thus we don't have
-	 * to worry about the inode being changed just because we released
-	 * the buffer.
-	 */
-	xfs_trans_brelse(tp, bp);
-	return 0;
 }
 
 /*
@@ -193,7 +180,6 @@ libxfs_ialloc(
 	struct fsxattr	*fsx,
 	int		okalloc,
 	xfs_buf_t	**ialloc_context,
-	boolean_t	*call_again,
 	xfs_inode_t	**ipp)
 {
 	xfs_ino_t	ino;
@@ -206,10 +192,10 @@ libxfs_ialloc(
 	 * the on-disk inode to be allocated.
 	 */
 	error = xfs_dialloc(tp, pip ? pip->i_ino : 0, mode, okalloc,
-			    ialloc_context, call_again, &ino);
+			    ialloc_context, &ino);
 	if (error != 0)
 		return error;
-	if (*call_again || ino == NULLFSINO) {
+	if (*ialloc_context || ino == NULLFSINO) {
 		*ipp = NULL;
 		return 0;
 	}
@@ -228,6 +214,7 @@ libxfs_ialloc(
 	ip->i_d.di_gid = cr->cr_gid;
 	xfs_set_projid(&ip->i_d, pip ? 0 : fsx->fsx_projid);
 	memset(&(ip->i_d.di_pad[0]), 0, sizeof(ip->i_d.di_pad));
+	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG | XFS_ICHGTIME_MOD);
 
 	/*
 	 * If the superblock version is up to where we support new format
@@ -253,7 +240,6 @@ libxfs_ialloc(
 	ip->i_d.di_size = 0;
 	ip->i_d.di_nextents = 0;
 	ASSERT(ip->i_d.di_nblocks == 0);
-	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG|XFS_ICHGTIME_MOD);
 	/*
 	 * di_gen will have been taken care of in xfs_iread.
 	 */
@@ -261,12 +247,25 @@ libxfs_ialloc(
 	ip->i_d.di_dmevmask = 0;
 	ip->i_d.di_dmstate = 0;
 	ip->i_d.di_flags = pip ? 0 : fsx->fsx_xflags;
+
+	if (ip->i_d.di_version == 3) {
+		ASSERT(ip->i_d.di_ino == ino);
+		ASSERT(uuid_equal(&ip->i_d.di_uuid, &mp->m_sb.sb_uuid));
+		ip->i_d.di_crc = 0;
+		ip->i_d.di_changecount = 1;
+		ip->i_d.di_lsn = 0;
+		ip->i_d.di_flags2 = 0;
+		memset(&(ip->i_d.di_pad2[0]), 0, sizeof(ip->i_d.di_pad2));
+		ip->i_d.di_crtime = ip->i_d.di_mtime;
+	}
+
 	flags = XFS_ILOG_CORE;
 	switch (mode & S_IFMT) {
 	case S_IFIFO:
 	case S_IFSOCK:
 		/* doesn't make sense to set an rdev for these */
 		rdev = 0;
+		/* FALLTHROUGH */
 	case S_IFCHR:
 	case S_IFBLK:
 		ip->i_d.di_format = XFS_DINODE_FMT_DEV;
@@ -420,6 +419,10 @@ libxfs_iflush_int(xfs_inode_t *ip, xfs_buf_t *bp)
 	ASSERT(ip->i_d.di_nextents+ip->i_d.di_anextents <= ip->i_d.di_nblocks);
 	ASSERT(ip->i_d.di_forkoff <= mp->m_sb.sb_inodesize);
 
+	/* bump the change count on v3 inodes */
+	if (ip->i_d.di_version == 3)
+		ip->i_d.di_changecount++;
+
 	/*
 	 * Copy the dirty parts of the inode into the on-disk
 	 * inode.  We always copy out the core of the inode,
@@ -455,13 +458,20 @@ libxfs_iflush_int(xfs_inode_t *ip, xfs_buf_t *bp)
 			dip->di_onlink = 0;
 			memset(&(ip->i_d.di_pad[0]), 0, sizeof(ip->i_d.di_pad));
 			memset(&(dip->di_pad[0]), 0, sizeof(dip->di_pad));
-			ASSERT(xfs_get_projid(ip->i_d) == 0);
+			ASSERT(xfs_get_projid(&ip->i_d) == 0);
 		}
 	}
 
 	xfs_iflush_fork(ip, dip, iip, XFS_DATA_FORK, bp);
 	if (XFS_IFORK_Q(ip)) 
 		xfs_iflush_fork(ip, dip, iip, XFS_ATTR_FORK, bp);
+
+	/* update the lsn in the on disk inode if required */
+	if (ip->i_d.di_version == 3)
+		dip->di_lsn = cpu_to_be64(iip->ili_item.li_lsn);
+
+	/* generate the checksum. */
+	xfs_dinode_calc_crc(mp, dip);
 
 	return 0;
 }
@@ -560,7 +570,7 @@ libxfs_alloc_file_space(
 	error = 0;
 	imapp = &imaps[0];
 	reccount = 1;
-	xfs_bmapi_flags = XFS_BMAPI_WRITE | (alloc_type ? XFS_BMAPI_PREALLOC : 0);
+	xfs_bmapi_flags = alloc_type ? XFS_BMAPI_PREALLOC : 0;
 	mp = ip->i_mount;
 	startoffset_fsb = XFS_B_TO_FSBT(mp, offset);
 	allocatesize_fsb = XFS_B_TO_FSB(mp, count);
@@ -571,24 +581,33 @@ libxfs_alloc_file_space(
 
 		tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
 		resblks = (uint)XFS_DIOSTRAT_SPACE_RES(mp, datablocks);
-		error = xfs_trans_reserve(tp, resblks, 0, 0, 0, 0);
-		if (error)
+		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
+					  resblks, 0);
+		/*
+		 * Check for running out of space
+		 */
+		if (error) {
+			/*
+			 * Free the transaction structure.
+			 */
+			ASSERT(error == ENOSPC);
+			xfs_trans_cancel(tp, 0);
 			break;
+		}
 		xfs_trans_ijoin(tp, ip, 0);
-		xfs_trans_ihold(tp, ip);
 
 		xfs_bmap_init(&free_list, &firstfsb);
-		error = xfs_bmapi(tp, ip, startoffset_fsb, allocatesize_fsb,
+		error = xfs_bmapi_write(tp, ip, startoffset_fsb, allocatesize_fsb,
 				xfs_bmapi_flags, &firstfsb, 0, imapp,
 				&reccount, &free_list);
 
 		if (error)
-			break;
+			goto error0;
 
 		/* complete the transaction */
 		error = xfs_bmap_finish(&tp, &free_list, &committed);
 		if (error)
-			break;
+			goto error0;
 
 		error = xfs_trans_commit(tp, 0);
 		if (error)
@@ -602,6 +621,11 @@ libxfs_alloc_file_space(
 		allocatesize_fsb -= allocated_fsb;
 	}
 	return error;
+
+error0:	/* Cancel bmap, cancel trans */
+	xfs_bmap_cancel(&free_list);
+	xfs_trans_cancel(tp, 0);
+	return error;
 }
 
 unsigned int
@@ -614,56 +638,6 @@ libxfs_log2_roundup(unsigned int i)
 			break;
 	}
 	return rval;
-}
-
-/*
- * Get a buffer for the dir/attr block, fill in the contents.
- * Don't check magic number, the caller will (it's xfs_repair).
- *
- * Originally from xfs_da_btree.c in the kernel, but only used
- * in userspace so it now resides here.
- */
-int
-libxfs_da_read_bufr(
-	xfs_trans_t	*trans,
-	xfs_inode_t	*dp,
-	xfs_dablk_t	bno,
-	xfs_daddr_t	mappedbno,
-	xfs_dabuf_t	**bpp,
-	int		whichfork)
-{
-	return xfs_da_do_buf(trans, dp, bno, &mappedbno, bpp, whichfork, 2,
-		(inst_t *)__return_address);
-}
-
-/*
- * Hold dabuf at transaction commit.
- *
- * Originally from xfs_da_btree.c in the kernel, but only used
- * in userspace so it now resides here.
- */
-void
-libxfs_da_bhold(xfs_trans_t *tp, xfs_dabuf_t *dabuf)
-{
-	int	i;
-
-	for (i = 0; i < dabuf->nbuf; i++)
-		xfs_trans_bhold(tp, dabuf->bps[i]);
-}
-
-/*
- * Join dabuf to transaction.
- *
- * Originally from xfs_da_btree.c in the kernel, but only used
- * in userspace so it now resides here.
- */
-void
-libxfs_da_bjoin(xfs_trans_t *tp, xfs_dabuf_t *dabuf)
-{
-	int	i;
-
-	for (i = 0; i < dabuf->nbuf; i++)
-		xfs_trans_bjoin(tp, dabuf->bps[i]);
 }
 
 /*
@@ -684,34 +658,43 @@ libxfs_inode_alloc(
 	struct fsxattr	*fsx,
 	xfs_inode_t	**ipp)
 {
-	boolean_t	call_again;
-	int		i;
 	xfs_buf_t	*ialloc_context;
 	xfs_inode_t	*ip;
 	xfs_trans_t	*ntp;
 	int		error;
 
-	call_again = B_FALSE;
 	ialloc_context = (xfs_buf_t *)0;
 	error = libxfs_ialloc(*tp, pip, mode, nlink, rdev, cr, fsx,
-			   1, &ialloc_context, &call_again, &ip);
-	if (error)
+			   1, &ialloc_context, &ip);
+	if (error) {
+		*ipp = NULL;
 		return error;
+	}
+	if (!ialloc_context && !ip) {
+		*ipp = NULL;
+		return XFS_ERROR(ENOSPC);
+	}
 
-	if (call_again) {
+	if (ialloc_context) {
+		struct xfs_trans_res	tres;
+
 		xfs_trans_bhold(*tp, ialloc_context);
+		tres.tr_logres = (*tp)->t_log_res;
+		tres.tr_logcount = (*tp)->t_log_count;
+
 		ntp = xfs_trans_dup(*tp);
 		xfs_trans_commit(*tp, 0);
 		*tp = ntp;
-		if ((i = xfs_trans_reserve(*tp, 0, 0, 0, 0, 0))) {
+		tres.tr_logflags = XFS_TRANS_PERM_LOG_RES;
+		error = xfs_trans_reserve(*tp, &tres, 0, 0);
+		if (error) {
 			fprintf(stderr, _("%s: cannot reserve space: %s\n"),
-				progname, strerror(i));
+				progname, strerror(error));
 			exit(1);
 		}
 		xfs_trans_bjoin(*tp, ialloc_context);
 		error = libxfs_ialloc(*tp, pip, mode, nlink, rdev, cr,
-				   fsx, 1, &ialloc_context,
-				   &call_again, &ip);
+				   fsx, 1, &ialloc_context, &ip);
 		if (!ip)
 			error = ENOSPC;
 		if (error)
@@ -760,4 +743,17 @@ cmn_err(int level, char *fmt, ...)
 	vfprintf(stderr, fmt, ap);
 	fputs("\n", stderr);
 	va_end(ap);
+}
+
+/*
+ * Warnings specifically for verifier errors.  Differentiate CRC vs. invalid
+ * values, and omit the stack trace unless the error level is tuned high.
+ */
+void
+xfs_verifier_error(
+	struct xfs_buf		*bp)
+{
+	xfs_alert(NULL, "Metadata %s detected at block 0x%llx/0x%x",
+		  bp->b_error == EFSBADCRC ? "CRC error" : "corruption",
+		  bp->b_bn, BBTOB(bp->b_length));
 }

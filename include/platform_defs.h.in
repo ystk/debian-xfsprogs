@@ -33,6 +33,8 @@
 #include <pthread.h>
 #include <ctype.h>
 #include <sys/types.h>
+#include <limits.h>
+#include <stdbool.h>
 
 #undef HAVE___U32
 #ifdef HAVE___U32
@@ -56,6 +58,10 @@ typedef signed long long int	__s64;
 #define __force
 #endif
 
+typedef __u16	__bitwise	__le16;
+typedef __u32	__bitwise	__le32;
+typedef __u64	__bitwise	__le64;
+
 typedef __u16	__bitwise	__be16;
 typedef __u32	__bitwise	__be32;
 typedef __u64	__bitwise	__be64;
@@ -77,26 +83,17 @@ typedef struct filldir		filldir_t;
 #endif
 
 /* long and pointer must be either 32 bit or 64 bit */
-#undef HAVE_32BIT_LONG
-#undef HAVE_64BIT_LONG
-#undef HAVE_32BIT_PTR
-#undef HAVE_64BIT_PTR
-
-#if defined(HAVE_32BIT_LONG)
-# define BITS_PER_LONG	32
-#elif defined(HAVE_64BIT_LONG)
-# define BITS_PER_LONG	64
-#else
-# error Unknown long size
-#endif
+#undef SIZEOF_LONG
+#undef SIZEOF_CHAR_P
+#define BITS_PER_LONG (SIZEOF_LONG * CHAR_BIT)
 
 /* Check if __psint_t is set to something meaningful */
 #undef HAVE___PSINT_T
 #ifndef HAVE___PSINT_T
-# ifdef HAVE_32BIT_PTR
+# if (SIZEOF_CHAR_P * CHAR_BIT) == 32
 typedef int __psint_t;
-# elif defined HAVE_64BIT_PTR
-#  ifdef HAVE_64BIT_LONG
+# elif (SIZEOF_CHAR_P * CHAR_BIT) == 64
+#  if BITS_PER_LONG == 64
 typedef long __psint_t;
 #  else
 /* This is a very strange architecture, which has 64 bit pointers but */
@@ -111,10 +108,10 @@ typedef long long __psint_t;
 /* Check if __psunsigned_t is set to something meaningful */
 #undef HAVE___PSUNSIGNED_T
 #ifndef HAVE___PSUNSIGNED_T
-# ifdef HAVE_32BIT_PTR
+# if (SIZEOF_CHAR_P * CHAR_BIT) == 32
 typedef unsigned int __psunsigned_t;
-# elif defined HAVE_64BIT_PTR
-#  ifdef HAVE_64BIT_LONG
+# elif (SIZEOF_CHAR_P * CHAR_BIT) == 64
+#  if BITS_PER_LONG == 64
 typedef long __psunsigned_t;
 #  else
 /* This is a very strange architecture, which has 64 bit pointers but */
@@ -124,6 +121,11 @@ typedef unsigned long long __psunsigned_t;
 # else
 #  error Unknown pointer size
 # endif
+#endif
+
+/* Check whether to define umode_t ourselves. */
+#ifndef HAVE_UMODE_T
+typedef unsigned short umode_t;
 #endif
 
 /* Define if you want gettext (I18N) support */
@@ -169,6 +171,11 @@ typedef unsigned long long __psunsigned_t;
 #define __arch_pack __attribute__((packed))
 #else
 #define __arch_pack
+#endif
+
+#ifndef min
+#define min(a,b)	(((a)<(b))?(a):(b))
+#define max(a,b)	(((a)>(b))?(a):(b))
 #endif
 
 #endif	/* __XFS_PLATFORM_DEFS_H__ */

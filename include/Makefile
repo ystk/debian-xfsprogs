@@ -23,16 +23,30 @@ QAHFILES = libxfs.h libxlog.h \
 	swab.h \
 	xfs_ag.h xfs_alloc.h xfs_alloc_btree.h xfs_arch.h xfs_attr_leaf.h \
 	xfs_attr_sf.h xfs_bit.h xfs_bmap.h xfs_bmap_btree.h xfs_btree.h \
-	xfs_btree_trace.h xfs_buf_item.h xfs_da_btree.h xfs_dinode.h \
-	xfs_dir2.h xfs_dir2_block.h xfs_dir2_data.h xfs_dir2_leaf.h \
-	xfs_dir2_node.h xfs_dir2_sf.h xfs_dir_leaf.h xfs_dir_sf.h \
-	xfs_extfree_item.h xfs_ialloc.h xfs_ialloc_btree.h \
-	xfs_inode.h xfs_inode_item.h xfs_inum.h \
-	xfs_log.h xfs_log_priv.h xfs_log_recover.h xfs_metadump.h \
-	xfs_mount.h xfs_quota.h xfs_rtalloc.h xfs_sb.h xfs_trace.h \
-	xfs_trans.h xfs_trans_space.h xfs_types.h xfs_dfrag.h
+	xfs_attr_remote.h \
+	xfs_btree_trace.h \
+	xfs_cksum.h \
+	xfs_da_btree.h \
+	xfs_da_format.h \
+	xfs_dinode.h \
+	xfs_dir2.h \
+	xfs_format.h \
+	xfs_ialloc.h \
+	xfs_ialloc_btree.h \
+	xfs_inode_buf.h \
+	xfs_inode_fork.h \
+	xfs_inum.h \
+	xfs_log_format.h \
+	xfs_log_recover.h \
+	xfs_metadump.h \
+	xfs_quota_defs.h \
+	xfs_sb.h \
+	xfs_shared.h \
+	xfs_trace.h \
+	xfs_trans_resv.h \
+	xfs_trans_space.h
 
-HFILES = handle.h jdm.h xqm.h xfs.h xfs_fs.h
+HFILES = handle.h jdm.h xqm.h xfs.h xfs_fs.h xfs_types.h
 HFILES += $(PKG_PLATFORM).h
 PHFILES = darwin.h freebsd.h irix.h linux.h gnukfreebsd.h
 DKHFILES = volume.h fstyp.h dvh.h

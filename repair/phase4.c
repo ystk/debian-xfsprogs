@@ -17,6 +17,8 @@
  */
 
 #include <libxfs.h>
+#include "threads.h"
+#include "prefetch.h"
 #include "avl.h"
 #include "globals.h"
 #include "agheader.h"
@@ -24,13 +26,10 @@
 #include "protos.h"
 #include "err_protos.h"
 #include "dinode.h"
-#include "dir.h"
 #include "bmap.h"
 #include "versions.h"
 #include "dir2.h"
-#include "threads.h"
 #include "progress.h"
-#include "prefetch.h"
 
 
 /*
@@ -40,7 +39,7 @@
  * free in which case they'd never be cleared so the fields wouldn't
  * be cleared by process_dinode().
  */
-void
+static void
 quotino_check(xfs_mount_t *mp)
 {
 	ino_tree_node_t *irec;
@@ -72,16 +71,29 @@ quotino_check(xfs_mount_t *mp)
 		if (irec == NULL || is_inode_free(irec,
 				mp->m_sb.sb_gquotino - irec->ino_startnum))  {
 			mp->m_sb.sb_gquotino = NULLFSINO;
-			if (mp->m_sb.sb_qflags & XFS_GQUOTA_ACCT)
-				lost_gquotino = 1;
-			else
-				lost_pquotino = 1;
+			lost_gquotino = 1;
 		} else
-			lost_gquotino = lost_pquotino = 0;
+			lost_gquotino = 0;
+	}
+
+	if (mp->m_sb.sb_pquotino != NULLFSINO && mp->m_sb.sb_pquotino != 0)  {
+		if (verify_inum(mp, mp->m_sb.sb_pquotino))
+			irec = NULL;
+		else
+			irec = find_inode_rec(mp,
+				XFS_INO_TO_AGNO(mp, mp->m_sb.sb_pquotino),
+				XFS_INO_TO_AGINO(mp, mp->m_sb.sb_pquotino));
+
+		if (irec == NULL || is_inode_free(irec,
+				mp->m_sb.sb_pquotino - irec->ino_startnum))  {
+			mp->m_sb.sb_pquotino = NULLFSINO;
+			lost_pquotino = 1;
+		} else
+			lost_pquotino = 0;
 	}
 }
 
-void
+static void
 quota_sb_check(xfs_mount_t *mp)
 {
 	/*
@@ -105,11 +117,13 @@ quota_sb_check(xfs_mount_t *mp)
 
 	if (fs_quotas &&
 	    (mp->m_sb.sb_uquotino == NULLFSINO || mp->m_sb.sb_uquotino == 0) &&
-	    (mp->m_sb.sb_gquotino == NULLFSINO || mp->m_sb.sb_gquotino == 0))  {
+	    (mp->m_sb.sb_gquotino == NULLFSINO || mp->m_sb.sb_gquotino == 0) &&
+	    (mp->m_sb.sb_pquotino == NULLFSINO || mp->m_sb.sb_pquotino == 0))  {
 		lost_quotas = 1;
 		fs_quotas = 0;
 	} else if (!verify_inum(mp, mp->m_sb.sb_uquotino) &&
-			!verify_inum(mp, mp->m_sb.sb_gquotino)) {
+			!verify_inum(mp, mp->m_sb.sb_gquotino) &&
+			!verify_inum(mp, mp->m_sb.sb_pquotino)) {
 		fs_quotas = 1;
 	}
 }
@@ -136,49 +150,7 @@ static void
 process_ags(
 	xfs_mount_t		*mp)
 {
-	int 			i, j;
-	xfs_agnumber_t 		agno;
-	work_queue_t		*queues;
-	prefetch_args_t		*pf_args[2];
-
-	queues = malloc(thread_count * sizeof(work_queue_t));
-
-	if (!libxfs_bcache_overflowed()) {
-		queues[0].mp = mp;
-		create_work_queue(&queues[0], mp, libxfs_nproc());
-		for (i = 0; i < mp->m_sb.sb_agcount; i++)
-			queue_work(&queues[0], process_ag_func, i, NULL);
-		destroy_work_queue(&queues[0]);
-	} else {
-		if (ag_stride) {
-			/*
-			 * create one worker thread for each segment of the volume
-			 */
-			for (i = 0, agno = 0; i < thread_count; i++) {
-				create_work_queue(&queues[i], mp, 1);
-				pf_args[0] = NULL;
-				for (j = 0; j < ag_stride && agno < mp->m_sb.sb_agcount;
-						j++, agno++) {
-					pf_args[0] = start_inode_prefetch(agno, 0, pf_args[0]);
-					queue_work(&queues[i], process_ag_func, agno, pf_args[0]);
-				}
-			}
-			/*
-			 * wait for workers to complete
-			 */
-			for (i = 0; i < thread_count; i++)
-				destroy_work_queue(&queues[i]);
-		} else {
-			queues[0].mp = mp;
-			pf_args[0] = start_inode_prefetch(0, 0, NULL);
-			for (i = 0; i < mp->m_sb.sb_agcount; i++) {
-				pf_args[(~i) & 1] = start_inode_prefetch(i + 1,
-						0, pf_args[i & 1]);
-				process_ag_func(&queues[0], i, pf_args[i & 1]);
-			}
-		}
-	}
-	free(queues);
+	do_inode_prefetch(mp, ag_stride, process_ag_func, true, false);
 }
 
 
@@ -196,8 +168,6 @@ phase4(xfs_mount_t *mp)
 	int			ag_hdr_len = 4 * mp->m_sb.sb_sectsize;
 	int			ag_hdr_block;
 	int			bstate;
-	int			count_bcnt_extents(xfs_agnumber_t agno);
-	int			count_bno_extents(xfs_agnumber_t agno);
 
 	ag_hdr_block = howmany(ag_hdr_len, mp->m_sb.sb_blocksize);
 

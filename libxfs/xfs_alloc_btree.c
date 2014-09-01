@@ -75,6 +75,8 @@ xfs_allocbt_alloc_block(
 		return 0;
 	}
 
+	xfs_extent_busy_reuse(cur->bc_mp, cur->bc_private.a.agno, bno, 1, false);
+
 	xfs_trans_agbtree_delta(cur->bc_tp, 1);
 	new->s = cpu_to_be32(bno);
 
@@ -89,7 +91,6 @@ xfs_allocbt_free_block(
 	struct xfs_buf		*bp)
 {
 	struct xfs_buf		*agbp = cur->bc_private.a.agbp;
-	struct xfs_agf		*agf = XFS_BUF_TO_AGF(agbp);
 	xfs_agblock_t		bno;
 	int			error;
 
@@ -98,19 +99,11 @@ xfs_allocbt_free_block(
 	if (error)
 		return error;
 
-	/*
-	 * Since blocks move to the free list without the coordination used in
-	 * xfs_bmap_finish, we can't allow block to be available for
-	 * reallocation and non-transaction writing (user data) until we know
-	 * that the transaction that moved it to the free list is permanently
-	 * on disk. We track the blocks by declaring these blocks as "busy";
-	 * the busy list is maintained on a per-ag basis and each transaction
-	 * records which entries should be removed when the iclog commits to
-	 * disk. If a busy block is allocated, the iclog is pushed up to the
-	 * LSN that freed the block.
-	 */
-	xfs_alloc_busy_insert(cur->bc_tp, be32_to_cpu(agf->agf_seqno), bno, 1);
+	xfs_extent_busy_insert(cur->bc_tp, be32_to_cpu(agf->agf_seqno), bno, 1,
+			      XFS_EXTENT_BUSY_SKIP_DISCARD);
 	xfs_trans_agbtree_delta(cur->bc_tp, -1);
+
+	xfs_trans_binval(cur->bc_tp, bp);
 	return 0;
 }
 
@@ -260,7 +253,122 @@ xfs_allocbt_key_diff(
 	return (__int64_t)be32_to_cpu(kp->ar_startblock) - rec->ar_startblock;
 }
 
-#ifdef DEBUG
+static bool
+xfs_allocbt_verify(
+	struct xfs_buf		*bp)
+{
+	struct xfs_mount	*mp = bp->b_target->bt_mount;
+	struct xfs_btree_block	*block = XFS_BUF_TO_BLOCK(bp);
+	struct xfs_perag	*pag = bp->b_pag;
+	unsigned int		level;
+
+	/*
+	 * magic number and level verification
+	 *
+	 * During growfs operations, we can't verify the exact level or owner as
+	 * the perag is not fully initialised and hence not attached to the
+	 * buffer.  In this case, check against the maximum tree depth.
+	 *
+	 * Similarly, during log recovery we will have a perag structure
+	 * attached, but the agf information will not yet have been initialised
+	 * from the on disk AGF. Again, we can only check against maximum limits
+	 * in this case.
+	 */
+	level = be16_to_cpu(block->bb_level);
+	switch (block->bb_magic) {
+	case cpu_to_be32(XFS_ABTB_CRC_MAGIC):
+		if (!xfs_sb_version_hascrc(&mp->m_sb))
+			return false;
+		if (!uuid_equal(&block->bb_u.s.bb_uuid, &mp->m_sb.sb_uuid))
+			return false;
+		if (block->bb_u.s.bb_blkno != cpu_to_be64(bp->b_bn))
+			return false;
+		if (pag &&
+		    be32_to_cpu(block->bb_u.s.bb_owner) != pag->pag_agno)
+			return false;
+		/* fall through */
+	case cpu_to_be32(XFS_ABTB_MAGIC):
+		if (pag && pag->pagf_init) {
+			if (level >= pag->pagf_levels[XFS_BTNUM_BNOi])
+				return false;
+		} else if (level >= mp->m_ag_maxlevels)
+			return false;
+		break;
+	case cpu_to_be32(XFS_ABTC_CRC_MAGIC):
+		if (!xfs_sb_version_hascrc(&mp->m_sb))
+			return false;
+		if (!uuid_equal(&block->bb_u.s.bb_uuid, &mp->m_sb.sb_uuid))
+			return false;
+		if (block->bb_u.s.bb_blkno != cpu_to_be64(bp->b_bn))
+			return false;
+		if (pag &&
+		    be32_to_cpu(block->bb_u.s.bb_owner) != pag->pag_agno)
+			return false;
+		/* fall through */
+	case cpu_to_be32(XFS_ABTC_MAGIC):
+		if (pag && pag->pagf_init) {
+			if (level >= pag->pagf_levels[XFS_BTNUM_CNTi])
+				return false;
+		} else if (level >= mp->m_ag_maxlevels)
+			return false;
+		break;
+	default:
+		return false;
+	}
+
+	/* numrecs verification */
+	if (be16_to_cpu(block->bb_numrecs) > mp->m_alloc_mxr[level != 0])
+		return false;
+
+	/* sibling pointer verification */
+	if (!block->bb_u.s.bb_leftsib ||
+	    (be32_to_cpu(block->bb_u.s.bb_leftsib) >= mp->m_sb.sb_agblocks &&
+	     block->bb_u.s.bb_leftsib != cpu_to_be32(NULLAGBLOCK)))
+		return false;
+	if (!block->bb_u.s.bb_rightsib ||
+	    (be32_to_cpu(block->bb_u.s.bb_rightsib) >= mp->m_sb.sb_agblocks &&
+	     block->bb_u.s.bb_rightsib != cpu_to_be32(NULLAGBLOCK)))
+		return false;
+
+	return true;
+}
+
+static void
+xfs_allocbt_read_verify(
+	struct xfs_buf	*bp)
+{
+	if (!xfs_btree_sblock_verify_crc(bp))
+		xfs_buf_ioerror(bp, EFSBADCRC);
+	else if (!xfs_allocbt_verify(bp))
+		xfs_buf_ioerror(bp, EFSCORRUPTED);
+
+	if (bp->b_error) {
+		trace_xfs_btree_corrupt(bp, _RET_IP_);
+		xfs_verifier_error(bp);
+	}
+}
+
+static void
+xfs_allocbt_write_verify(
+	struct xfs_buf	*bp)
+{
+	if (!xfs_allocbt_verify(bp)) {
+		trace_xfs_btree_corrupt(bp, _RET_IP_);
+		xfs_buf_ioerror(bp, EFSCORRUPTED);
+		xfs_verifier_error(bp);
+		return;
+	}
+	xfs_btree_sblock_calc_crc(bp);
+
+}
+
+const struct xfs_buf_ops xfs_allocbt_buf_ops = {
+	.verify_read = xfs_allocbt_read_verify,
+	.verify_write = xfs_allocbt_write_verify,
+};
+
+
+#if defined(DEBUG) || defined(XFS_WARN)
 STATIC int
 xfs_allocbt_keys_inorder(
 	struct xfs_btree_cur	*cur,
@@ -381,8 +489,8 @@ static const struct xfs_btree_ops xfs_allocbt_ops = {
 	.init_rec_from_cur	= xfs_allocbt_init_rec_from_cur,
 	.init_ptr_from_cur	= xfs_allocbt_init_ptr_from_cur,
 	.key_diff		= xfs_allocbt_key_diff,
-
-#ifdef DEBUG
+	.buf_ops		= &xfs_allocbt_buf_ops,
+#if defined(DEBUG) || defined(XFS_WARN)
 	.keys_inorder		= xfs_allocbt_keys_inorder,
 	.recs_inorder		= xfs_allocbt_recs_inorder,
 #endif
@@ -415,16 +523,22 @@ xfs_allocbt_init_cursor(
 
 	cur->bc_tp = tp;
 	cur->bc_mp = mp;
-	cur->bc_nlevels = be32_to_cpu(agf->agf_levels[btnum]);
 	cur->bc_btnum = btnum;
 	cur->bc_blocklog = mp->m_sb.sb_blocklog;
-
 	cur->bc_ops = &xfs_allocbt_ops;
-	if (btnum == XFS_BTNUM_CNT)
+
+	if (btnum == XFS_BTNUM_CNT) {
+		cur->bc_nlevels = be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNT]);
 		cur->bc_flags = XFS_BTREE_LASTREC_UPDATE;
+	} else {
+		cur->bc_nlevels = be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNO]);
+	}
 
 	cur->bc_private.a.agbp = agbp;
 	cur->bc_private.a.agno = agno;
+
+	if (xfs_sb_version_hascrc(&mp->m_sb))
+		cur->bc_flags |= XFS_BTREE_CRC_BLOCKS;
 
 	return cur;
 }

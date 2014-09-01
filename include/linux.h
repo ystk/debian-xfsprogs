@@ -27,26 +27,45 @@
 #include <malloc.h>
 #include <getopt.h>
 #include <endian.h>
+#include <stdbool.h>
 
 static __inline__ int xfsctl(const char *path, int fd, int cmd, void *p)
 {
 	return ioctl(fd, cmd, p);
 }
 
+/*
+ * platform_test_xfs_*() implies that xfsctl will succeed on the file;
+ * on Linux, at least, special files don't get xfs file ops,
+ * so return 0 for those
+ */
+
 static __inline__ int platform_test_xfs_fd(int fd)
 {
-	struct statfs buf;
-	if (fstatfs(fd, &buf) < 0)
+	struct statfs statfsbuf;
+	struct stat statbuf;
+
+	if (fstatfs(fd, &statfsbuf) < 0)
 		return 0;
-	return (buf.f_type == 0x58465342);	/* XFSB */
+	if (fstat(fd, &statbuf) < 0)
+		return 0;
+	if (!S_ISREG(statbuf.st_mode) && !S_ISDIR(statbuf.st_mode))
+		return 0;
+	return (statfsbuf.f_type == 0x58465342);	/* XFSB */
 }
 
 static __inline__ int platform_test_xfs_path(const char *path)
 {
-	struct statfs buf;
-	if (statfs(path, &buf) < 0)
+	struct statfs statfsbuf;
+	struct stat statbuf;
+
+	if (statfs(path, &statfsbuf) < 0)
 		return 0;
-	return (buf.f_type == 0x58465342);	/* XFSB */
+	if (stat(path, &statbuf) < 0)
+		return 0;
+	if (!S_ISREG(statbuf.st_mode) && !S_ISDIR(statbuf.st_mode))
+		return 0;
+	return (statfsbuf.f_type == 0x58465342);	/* XFSB */
 }
 
 static __inline__ int platform_fstatfs(int fd, struct statfs *buf)
@@ -117,6 +136,7 @@ platform_discard_blocks(int fd, uint64_t start, uint64_t len)
 
 #define ENOATTR		ENODATA	/* Attribute not found */
 #define EFSCORRUPTED	EUCLEAN	/* Filesystem is corrupted */
+#define EFSBADCRC	EBADMSG	/* Bad CRC detected */
 
 typedef loff_t		xfs_off_t;
 typedef __uint64_t	xfs_ino_t;

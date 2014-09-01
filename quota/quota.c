@@ -224,7 +224,7 @@ quota_user_type(
 	uid_t		id;
 
 	if (name) {
-		if (isdigit(name[0])) {
+		if (isdigits_only(name)) {
 			id = atoi(name);
 			name = getusername(id, flags & NO_LOOKUP_FLAG);
 		} else if ((u = getpwnam(name))) {
@@ -273,7 +273,7 @@ quota_group_type(
 	int		i, ngroups, dofree = 0;
 
 	if (name) {
-		if (isdigit(name[0])) {
+		if (isdigits_only(name)) {
 			gid = atoi(name);
 			name = getgroupname(gid, flags & NO_LOOKUP_FLAG);
 		} else {
@@ -289,15 +289,19 @@ quota_group_type(
 		}
 		gids = &gid;
 		ngroups = 1;
-	} else if ( ((ngroups = sysconf(_SC_NGROUPS_MAX)) < 0) ||
-		    ((gids = malloc(ngroups * sizeof(gid_t))) == NULL) ||
-		    ((ngroups = getgroups(ngroups, gids)) < 0)) {
-		dofree = (gids != NULL);
-		gid = getgid();
-		gids = &gid;
-		ngroups = 1;
 	} else {
-		dofree = (gids != NULL);
+		if ( ((ngroups = sysconf(_SC_NGROUPS_MAX)) < 0) ||
+		     ((gids = malloc(ngroups * sizeof(gid_t))) == NULL) ||
+		     ((ngroups = getgroups(ngroups, gids)) < 0)) {
+			/* something failed.  Fall back to 1 group */
+			free(gids);
+			gid = getgid();
+			gids = &gid;
+			ngroups = 1;
+		} else {
+			/* It all worked, and we allocated memory */
+			dofree = 1;
+		}
 	}
 
 	for (i = 0; i < ngroups; i++, name = NULL) {
@@ -344,7 +348,7 @@ quota_proj_type(
 		return;
 	}
 
-	if (isdigit(name[0])) {
+	if (isdigits_only(name)) {
 		id = atoi(name);
 		name = getprojectname(id, flags & NO_LOOKUP_FLAG);
 	} else if ((p = getprnam(name))) {

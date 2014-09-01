@@ -18,6 +18,8 @@
 
 /*
  * Estimate space of an XFS filesystem
+ *
+ * XXX: assumes dirv1 format.
  */
 #include <xfs/libxfs.h>
 #include <sys/stat.h>
@@ -48,7 +50,7 @@ int ffn(const char *, const struct stat64 *, int, struct FTW *);
 #define BLOCKSIZE	4096
 #define INODESIZE	256
 #define PERDIRENTRY	\
-	(sizeof(xfs_dir_leaf_entry_t) + sizeof(xfs_dir_leaf_name_t))
+	(sizeof(xfs_dir2_leaf_entry_t) + sizeof(xfs_dir2_data_entry_t))
 #define LOGSIZE		1000
 
 #define FBLOCKS(n)	((n)/blocksize)
@@ -78,6 +80,7 @@ usage(char *progname)
 		"\t-i logsize (internal log size)\n"
 		"\t-e logsize (external log size)\n"
 		"\t-v prints more verbose messages\n"
+		"\t-V prints version and exits\n"
 		"\t-h prints this usage message\n\n"
 	"Note:\tblocksize may have 'k' appended to indicate x1024\n"
 	"\tlogsize may also have 'm' appended to indicate (1024 x 1024)\n"),

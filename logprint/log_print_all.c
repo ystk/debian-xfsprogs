@@ -23,13 +23,13 @@
  */
 int
 xlog_print_find_oldest(
-	struct log	*log,
+	struct xlog	*log,
 	xfs_daddr_t	*last_blk)
 {
 	xfs_buf_t	*bp;
 	xfs_daddr_t	first_blk;
 	uint		first_half_cycle, last_half_cycle;
-	int		error;
+	int		error = 0;
 
 	if (xlog_find_zeroed(log, &first_blk))
 		return 0;
@@ -43,17 +43,14 @@ xlog_print_find_oldest(
 	last_half_cycle = xlog_get_cycle(XFS_BUF_PTR(bp));
 	ASSERT(last_half_cycle != 0);
 
-	if (first_half_cycle == last_half_cycle) { /* all cycle nos are same */
+	if (first_half_cycle == last_half_cycle) /* all cycle nos are same */
 		*last_blk = 0;
-	} else {		/* have 1st and last; look for middle cycle */
+	else		/* have 1st and last; look for middle cycle */
 		error = xlog_find_cycle_start(log, bp, first_blk,
 					      last_blk, last_half_cycle);
-		if (error)
-			return error;
-	}
 
 	xlog_put_bp(bp);
-	return 0;
+	return error;
 }
 
 void
@@ -92,7 +89,6 @@ xlog_recover_print_buffer(
 	xfs_disk_dquot_t	*ddq;
 
 	f = (xfs_buf_log_format_t *)item->ri_buf[0].i_addr;
-	len = item->ri_buf[0].i_len;
 	printf("	");
 	ASSERT(f->blf_type == XFS_LI_BUF);
 	printf(_("BUF:  #regs:%d   start blkno:0x%llx   len:%d   bmap size:%d   flags:0x%x\n"),
@@ -122,6 +118,7 @@ xlog_recover_print_buffer(
 			       be32_to_cpu(*(__be32 *)(p+56)),
 			       be32_to_cpu(*(__be32 *)(p+60)));
 		} else if (be32_to_cpu(*(__be32 *)p) == XFS_AGI_MAGIC) {
+			int bucket, buckets;
 			agi = (xfs_agi_t *)p;
 			printf(_("	AGI Buffer: (XAGI)\n"));
 			if (!print_buffer) 
@@ -137,6 +134,24 @@ xlog_recover_print_buffer(
 				be32_to_cpu(agi->agi_level),
 				be32_to_cpu(agi->agi_freecount),
 				be32_to_cpu(agi->agi_newino));
+			if (len == 128) {
+				buckets = 17;
+			} else if (len == 256) {
+				buckets = 32 + 17;
+			} else {
+				buckets = XFS_AGI_UNLINKED_BUCKETS;
+			}
+			for (bucket = 0; bucket < buckets;) {
+				int col;
+				printf(_("bucket[%d - %d]: "), bucket, bucket+3);
+				for (col = 0; col < 4; col++, bucket++) {
+					if (bucket < buckets) {
+						printf("0x%x ",
+			be32_to_cpu(agi->agi_unlinked[bucket]));
+					}
+				}
+				printf("\n");
+			}
 		} else if (be32_to_cpu(*(__be32 *)p) == XFS_AGF_MAGIC) {
 			agf = (xfs_agf_t *)p;
 			printf(_("	AGF Buffer: (XAGF)\n"));
@@ -243,7 +258,7 @@ xlog_recover_print_inode_core(
 	       (di->di_magic>>8) & 0xff, di->di_magic & 0xff,
 	       di->di_mode, di->di_version, di->di_format, di->di_onlink);
 	printf(_("		uid:%d  gid:%d  nlink:%d projid:%u\n"),
-	       di->di_uid, di->di_gid, di->di_nlink, xfs_get_projid(*di));
+	       di->di_uid, di->di_gid, di->di_nlink, xfs_get_projid(di));
 	printf(_("		atime:%d  mtime:%d  ctime:%d\n"),
 	       di->di_atime.t_sec, di->di_mtime.t_sec, di->di_ctime.t_sec);
 	printf(_("		flushiter:%d\n"), di->di_flushiter);
@@ -276,7 +291,8 @@ xlog_recover_print_inode(
 	       f->ilf_dsize);
 
 	/* core inode comes 2nd */
-	ASSERT(item->ri_buf[1].i_len == sizeof(xfs_icdinode_t));
+	ASSERT(item->ri_buf[1].i_len == xfs_icdinode_size(1) ||
+		item->ri_buf[1].i_len == xfs_icdinode_size(3));
 	xlog_recover_print_inode_core((xfs_icdinode_t *)
 				      item->ri_buf[1].i_addr);
 
@@ -394,7 +410,7 @@ xlog_recover_print_efi(
 	    fprintf(stderr, _("%s: xlog_recover_print_efi: malloc failed\n"), progname);
 	    exit(1);
 	}
-	if (xfs_efi_copy_format((char*)src_f, src_len, f)) {
+	if (xfs_efi_copy_format((char*)src_f, src_len, f, 0)) {
 	    free(f);
 	    return;
 	}
@@ -415,6 +431,21 @@ xlog_recover_print_efi(
 	free(f);
 }
 
+STATIC void
+xlog_recover_print_icreate(
+	struct xlog_recover_item	*item)
+{
+	struct xfs_icreate_log	*icl;
+
+	icl = (struct xfs_icreate_log *)item->ri_buf[0].i_addr;
+
+	printf(_("	ICR:  #ag: %d  agbno: 0x%x  len: %d\n"
+		 "	      cnt: %d  isize: %d    gen: 0x%x\n"),
+		be32_to_cpu(icl->icl_ag), be32_to_cpu(icl->icl_agbno),
+		be32_to_cpu(icl->icl_length), be32_to_cpu(icl->icl_count),
+		be32_to_cpu(icl->icl_isize), be32_to_cpu(icl->icl_gen));
+}
+
 void
 xlog_recover_print_logitem(
 	xlog_recover_item_t	*item)
@@ -422,6 +453,9 @@ xlog_recover_print_logitem(
 	switch (ITEM_TYPE(item)) {
 	case XFS_LI_BUF:
 		xlog_recover_print_buffer(item);
+		break;
+	case XFS_LI_ICREATE:
+		xlog_recover_print_icreate(item);
 		break;
 	case XFS_LI_INODE:
 		xlog_recover_print_inode(item);
@@ -453,6 +487,9 @@ xlog_recover_print_item(
 	switch (ITEM_TYPE(item)) {
 	case XFS_LI_BUF:
 		printf("BUF");
+		break;
+	case XFS_LI_ICREATE:
+		printf("ICR");
 		break;
 	case XFS_LI_INODE:
 		printf("INO");

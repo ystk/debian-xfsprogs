@@ -1,3 +1,36 @@
+xfsprogs (3.2.1) unstable; urgency=low
+
+  * New upstream release (closes: #747080)
+  * Add a watch file (closes: #748483)
+
+ -- Nathan Scott <nathans@debian.org>  Wed, 16 Jul 2014 13:47:49 +1000
+
+xfsprogs (3.2.0) unstable; urgency=low
+
+  * New upstream release
+  * Add dh-autoreconf invocation (closes: #725971)
+
+ -- Nathan Scott <nathans@debian.org>  Sat, 03 May 2014 15:59:55 +1000
+
+xfsprogs (3.1.11) unstable; urgency=low
+
+  * New upstream release
+
+ -- Nathan Scott <nathans@debian.org>  Wed, 08 May 2013 12:59:56 -0500
+
+xfsprogs (3.1.9) unstable; urgency=low
+
+  * New upstream release
+
+ -- Nathan Scott <nathans@debian.org>  Wed, 31 Oct 2012 13:29:00 +1100
+
+xfsprogs (3.1.8) unstable; urgency=low
+
+  * New upstream release
+  * Numerous xfs_repair fixes
+
+ -- Nathan Scott <nathans@debian.org>  Mon, 19 Mar 2012 14:21:00 +1100
+
 xfsprogs (3.1.7) unstable; urgency=low
 
   * New upstream release

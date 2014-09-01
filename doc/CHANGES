@@ -1,3 +1,199 @@
+xfsprogs-3.2.1 (15 July 2014)
+	- Added support for new on-disk free inode btree (Brian Foster)
+	- libxfs inode use-after free fixes (Mark Tinguely)
+	- xfs_copy threading cleanups (Junxiao Bi)
+	- xfs_check has been removed
+	- C++ header compiler fixes (Roger Willcocks)
+	- xfs_repair prefetch fixes (Eric Sandeen)
+	- xfs_repair directory block CRC detection fixes (Jan Kara)
+	- xfs_repair directory rebuild fixes
+	- libxfs buffer error handling fixes
+	- xfs_repair quota inode handling fixes
+	- removed incorrect asserts from phase 2 of xfs_repair
+	- updated Polish translations (Jakub Bogusz)
+	- xfs_mkfs 4k sector device fixes (Eric Sandeen)
+	- xfs_fsr cleanups nd fixes (Eric Sandeen)
+	- mount options described in xfs(5) man page (Eric Sandeen)
+
+xfsprogs-3.2.0 (16 May 2014)
+	- First release with full support of CRC enabled filesystems
+	- No code changes from 3.2.0-rc3
+
+xfsprogs-3.2.0-rc3 (9 May 2014)
+	- Third release candidate for full support of CRC enabled filesystems
+	- Updated Debian change logs in preparation for release (Nathan Scott)
+	- Build warning fixes (Nathan Scott)
+	- xfs_repair prefetch fix (Eric Sandeen)
+	- xfs_repair block tracking scalability fix
+
+xfsprogs-3.2.0-rc2 (2 May 2014)
+	- Second release candidate for full support of CRC enabled filesystems
+	- xfs_repair has full CRC validation and repair
+	- Coverity related cleanups and fixes
+
+xfsprogs-3.2.0-rc1 (14 April 2014)
+	- First release candidate for full support of CRC enabled filesystems
+	- Large number of Coverity related fixes and cleanups
+	- disambiguous of CRC validation errors from IO errors.
+	- Improved dangerous mode handling in repair
+	- repair handles garbage in zeroed areas of superblocks better
+	- repair validates dirent ftype field fully
+	- metadump fully supports discontiguous directory blocks
+	- metadump only recalculates CRCs on metadata it obfuscates so as to
+	  preserve errors in the metadata where possible.
+	- default log size that mkfs creates is now reverted to the same size
+	  as 3.1.x releases create.
+	- mkfs sets the ftype on directory entries correctly during protofile
+	  population
+	- xfs_io support O_TMPFILE, flink, FALLOC_FL_ZERO_RANGE and
+	  FALLOC_FL_COLLAPSE_RANGE,
+	- logprint handles split entries better
+
+xfsprogs-3.2.0-alpha2 (25 November 2013)
+	- Alpha release for the purpose of testing the CRC feature in
+	  kernels 3.10 and newer.
+	- Enable xfs_db write support and xfs_metadump support for CRC
+	  enabled filesystems.
+	- Add directory entry filetype support for non-CRC filesystems.
+	- Remove experimental warnings for CRC filesystems.
+	- Ensure all inodes created by xfs_repair have a proper d_type set.
+	- Fix build on big endian machines.
+	- Properly handle symlinks to devices on various tool commandlines.
+	- Fix xfs_repair's dirty log detection for 4k sector logs, broken
+	  in Alpha1.
+	- Fix a potential segfault in xfs_repair when issuing progress 
+	  reports.
+	- Fix potential xfs_fsr failures when running w/ selinux.
+	- Update config.guess/config.sub for arm64, thanks to Colin Watson.
+	- Stop wasting memory by caching inode structures in xfs_repair -
+	  they are never re-used.  Thanks to Christoph Hellwig.
+	- Fix several Coverity-found defects, thanks to Li Zhong.
+	- Fix platform_test_xfs_fd to return false on special files which
+	  cannot take an xfs ioctl.
+	- Sync up libxfs with kernel code.
+	- Improved xfs_repair performance on large filesystems
+	  (always use prefetch and strided AG scanning functionality)
+
+
+xfsprogs-3.2.0-alpha1 (26 September 2013)
+	- Alpha release for the purpose of testing the CRC feature in
+	  kernels 3.10 and newer.
+	- Remove all vestiges of old, unsupported version 1 directory code.
+	- Add a "readdir" command to xfs_io, thanks to Brian Foster.
+	- Fix potential segfault in xfs_repair when creating lost+found.
+	- Zero out unused parts of on-disk superblocks during repair, to
+	  avoid metadata verifier failures at runtime.
+	- Add directory entry type support to mkfs.xfs and xfs_db.
+	- Add the icreate transaction to xfs_logprint, and fix continuation
+	  transactions.
+	- Add the lseek SEEK_DATA/SEEK_HOLE support into xfs_io.
+	- Print all AGI unlinked buckets in xfs_logprint.
+	- Fix mkfs.xfs ENOSPC with protofile which creates a very large
+	  directory.
+	- Fix several Coverity-found defects, thanks to Li Zhong.
+	- Do all file reads in xfs_fsr using O_DIRECT.
+	- Sync up libxfs with kernel code.
+	- Add support for concurrent group and project quota usage on CRC
+	  enabled filesystems.
+	- Ensure mkfs creates log sizes that are always large enough for
+	  the configured fileystem geometry.
+
+xfsprogs-3.1.11 (8 May 2013)
+	- Support for relative paths in xfs_quota thanks to Satoru Takeuchi.
+	- mkfs.xfs will always go into multidisk mode when filesystem
+	  geometry is specified on the command line.
+	- Document all commands in xfs_io.
+	- Remove setfl command from xfs_io.
+	- xfs_metadump will obfuscate symlinks by path component.
+	- mkfs.xfs no longer accepts geometry settings smaller than the
+	  physical sector size.
+	- xfs_logprint now supports multiply-logged inode fields and
+	  handles continued inode transactions correctly.
+	- kill XLOG_SET
+	- Update release scripts to use git archive to address a
+	  missing source file reported by Arkadiusz Mi?kiewicz
+	- Fix a build error with -Werror=format-security, reported
+	  by Arkadiusz Mi?kiewicz
+	- mkfs.xfs no longer attempts to discard when -N option is used.
+	- Update 'make deb' to use tarball
+	- Sync up with log reservation changes in the kernel.
+	- Fix possible unallocated memory access in fiemap.
+	- Guard against string overflow in path_to_fspath.
+	- Fix setup_cursor array allocation.
+	- Fix free of unintialized pointer in xfs_acl_valid error path.
+	- Guard against path string overflows.
+	- Check strdup results properly in initallfs().
+	- Fix attribute no_change_count logic.
+	- Remove extraneous close() in fsrallfs().
+	- xfs_repair now skips the freelist scan of a corrupt agf
+	  when in no-modify mode.
+	- xfs_db now skips freelist scans of corrupt agfs.
+	- Remove unconditional ASSERT(0) in xfs_repair.
+	- Reduce bb_numrecs in bno/cnt btrees when log consumes all agf space.
+	- Add depraction message for xfs_check.
+	- xfs_quota allow user or group names beginning with digits reported
+	  by James Carter.
+	- Fix manpages and usage() spelling, errors and omissions.
+	- Validate the extent count is at least within the positive
+	  range of a signed 32 bit integer before using it.
+
+xfsprogs-3.1.10 (13 December 2012)
+	- Update release script to make a source tarball.
+
+xfsprogs-3.1.9 (31 October 2012)
+	- Print nice details if agsize is out of bounds in mkfs.xfs.
+	- Various fixes for fragmented multi-block dir2 handling in
+	  xfs_repair.
+	- Fix extent record printing in xfs_db on big endian arches.
+	- Use the correct macros when dumping block maps in extent
+	  form in xfs_db, thanks to Peter Watkins.
+	- Add sync file range support to xfs_io.
+	- Implement preadv/pwritev in xfs_io.
+	- Link against libreadline for libxcmd, thanks to Mike Frysinger.
+	- Clean up mkfs.xfs output on invalid inode size.
+	- Various build fixes, thanks to Mike Frysinger and Jan Engelhardt.
+
+xfsprogs-3.1.8 (20 March 2012)
+	- Fix xfs_repair segfault on a corrupted filesystem by validating the
+	  acl count before reading it.
+	- Avoid xfs_repair deadlocks on prefetched buffers.
+	- Fix various incorrect printf formats, thanks to Jakub Bogusz for
+	  reporting.
+	- Polish translation update, thanks to Jakub Bogusz.
+	- Refuse mkfs.xfs on misaligned devices when using 4k sectors, unless
+	  the -f option is specified, and then force 512b sector size,
+	  thanks to Carlos Maiolino.
+	- Avoid a possible loop on the unlinked inode list in phase 3 of
+	  xfs_repair, thanks to Stefan Pfetzing for reporting.
+	- Allocate inode and free extent records individually in xfs_repair.
+	- Fix a possible deadlock btree nodes in xfs_repair by using recursive
+	  locking, thanks to Arkadiusz Miśkiewicz for reporting and testing.
+	- Fix possible xfs_repair deadlocks in inode prefetching, thanks to
+	  Arkadiusz Miśkiewicz for reporting and testing.
+	- Make xfs_repair handle filesystems with the log in ag 0, thanks to
+	  Sindre Skogen for reporting.
+	- Deprecate the -F foreign flag to xfs_io.
+	- Add debian linux-libc-dev build dependancy.
+	- Add an extended fiemap configure check.
+	- Various cleanups in xfs_repair.
+	- Update xfs_check man page to recommend xfs_repair over xfs_check,
+	  thanks to Arkadiusz Miśkiewicz.
+	- Update the on-disk extent count as part of inode repair when moving
+	  inodes to lost+found to avoid to avoid tripping over a check in
+	  xfs_iformat, thanks to Arkadiusz Miśkiewicz for reporting and
+	  testing.
+	- Check for size parsing errors in xfs_quota, thanks to James Lawrie
+	  for reporting.
+	- Fix fiemap loop continuation in xfs_io.
+	- Make mkfs.xfs properly handle physical sector size.
+	- Fix /proc/mounts parsing in xfs_fsr.
+	- Fix xfs_repair when ag_stride options with attributes and dirv1 code,
+	  thanks to Tom Crane for reporting and testing.
+	- Fix message formats in process_dinode_int.
+	- Fix xfs_repair handling of link counts when the on-disk count
+	  overflows 8 bits.
+	- Fix messages from set_nlinks in xfs_repair.
+
 xfsprogs-3.1.7 (17 November 2011)
 	- Pull in fix for debian/control
 	- Polish translation update, thanks to Jakub Bogusz

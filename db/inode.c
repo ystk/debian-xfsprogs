@@ -46,8 +46,8 @@ static int	inode_u_bmx_count(void *obj, int startoff);
 static int	inode_u_c_count(void *obj, int startoff);
 static int	inode_u_dev_count(void *obj, int startoff);
 static int	inode_u_muuid_count(void *obj, int startoff);
-static int	inode_u_sfdir_count(void *obj, int startoff);
 static int	inode_u_sfdir2_count(void *obj, int startoff);
+static int	inode_u_sfdir3_count(void *obj, int startoff);
 static int	inode_u_symlink_count(void *obj, int startoff);
 
 static const cmdinfo_t	inode_cmd =
@@ -56,6 +56,10 @@ static const cmdinfo_t	inode_cmd =
 
 const field_t	inode_hfld[] = {
 	{ "", FLDT_INODE, OI(0), C1, 0, TYP_NONE },
+	{ NULL }
+};
+const field_t	inode_crc_hfld[] = {
+	{ "", FLDT_INODE_CRC, OI(0), C1, 0, TYP_NONE },
 	{ NULL }
 };
 
@@ -70,6 +74,17 @@ const field_t	inode_flds[] = {
 	  FLD_COUNT|FLD_OFFSET, TYP_NONE },
 	{ NULL }
 };
+const field_t	inode_crc_flds[] = {
+	{ "core", FLDT_DINODE_CORE, OI(OFF(magic)), C1, 0, TYP_NONE },
+	{ "next_unlinked", FLDT_AGINO, OI(OFF(next_unlinked)), C1, 0,
+	  TYP_INODE },
+	{ "v3", FLDT_DINODE_V3, OI(OFF(magic)), C1, 0, TYP_NONE },
+	{ "u3", FLDT_DINODE_U, inode_u_offset, C1, FLD_OFFSET, TYP_NONE },
+	{ "a", FLDT_DINODE_A, inode_a_offset, inode_a_count,
+	  FLD_COUNT|FLD_OFFSET, TYP_NONE },
+	{ NULL }
+};
+
 
 #define	COFF(f)	bitize(offsetof(xfs_dinode_t, di_ ## f))
 const field_t	inode_core_flds[] = {
@@ -152,6 +167,18 @@ const field_t	inode_core_flds[] = {
 	{ NULL }
 };
 
+const field_t	inode_v3_flds[] = {
+	{ "crc", FLDT_CRC, OI(COFF(crc)), C1, 0, TYP_NONE },
+	{ "change_count", FLDT_UINT64D, OI(COFF(changecount)), C1, 0, TYP_NONE },
+	{ "lsn", FLDT_UINT64X, OI(COFF(lsn)), C1, 0, TYP_NONE },
+	{ "flags2", FLDT_UINT64X, OI(COFF(flags2)), C1, 0, TYP_NONE },
+	{ "crtime", FLDT_TIMESTAMP, OI(COFF(crtime)), C1, 0, TYP_NONE },
+	{ "inumber", FLDT_INO, OI(COFF(ino)), C1, 0, TYP_NONE },
+	{ "uuid", FLDT_UUID, OI(COFF(uuid)), C1, 0, TYP_NONE },
+	{ NULL }
+};
+
+
 #define	TOFF(f)	bitize(offsetof(xfs_timestamp_t, t_ ## f))
 const field_t	timestamp_flds[] = {
 	{ "sec", FLDT_TIME, OI(TOFF(sec)), C1, 0, TYP_NONE },
@@ -166,8 +193,8 @@ const field_t	inode_u_flds[] = {
 	{ "c", FLDT_CHARNS, NULL, inode_u_c_count, FLD_COUNT, TYP_NONE },
 	{ "dev", FLDT_DEV, NULL, inode_u_dev_count, FLD_COUNT, TYP_NONE },
 	{ "muuid", FLDT_UUID, NULL, inode_u_muuid_count, FLD_COUNT, TYP_NONE },
-	{ "sfdir", FLDT_DIRSHORT, NULL, inode_u_sfdir_count, FLD_COUNT, TYP_NONE },
 	{ "sfdir2", FLDT_DIR2SF, NULL, inode_u_sfdir2_count, FLD_COUNT, TYP_NONE },
+	{ "sfdir3", FLDT_DIR3SF, NULL, inode_u_sfdir3_count, FLD_COUNT, TYP_NONE },
 	{ "symlink", FLDT_CHARNS, NULL, inode_u_symlink_count, FLD_COUNT,
 	  TYP_NONE },
 	{ NULL }
@@ -404,7 +431,7 @@ inode_next_type(void)
 {
 	switch (iocur_top->mode & S_IFMT) {
 	case S_IFDIR:
-		return xfs_sb_version_hasdirv2(&mp->m_sb) ? TYP_DIR2 : TYP_DIR;
+		return TYP_DIR2;
 	case S_IFLNK:
 		return TYP_SYMLINK;
 	case S_IFREG:
@@ -413,7 +440,8 @@ inode_next_type(void)
 		else if (iocur_top->ino == mp->m_sb.sb_rsumino)
 			return TYP_RTSUMMARY;
 		else if (iocur_top->ino == mp->m_sb.sb_uquotino ||
-			 iocur_top->ino == mp->m_sb.sb_gquotino)
+			 iocur_top->ino == mp->m_sb.sb_gquotino ||
+			 iocur_top->ino == mp->m_sb.sb_pquotino)
 			return TYP_DQBLK;
 		else
 			return TYP_DATA;
@@ -519,22 +547,6 @@ inode_u_muuid_count(
 }
 
 static int
-inode_u_sfdir_count(
-	void		*obj,
-	int		startoff)
-{
-	xfs_dinode_t	*dip;
-
-	ASSERT(bitoffs(startoff) == 0);
-	ASSERT(obj == iocur_top->data);
-	dip = obj;
-	ASSERT((char *)XFS_DFORK_DPTR(dip) - (char *)dip == byteize(startoff));
-	return dip->di_format == XFS_DINODE_FMT_LOCAL &&
-	       (be16_to_cpu(dip->di_mode) & S_IFMT) == S_IFDIR
-	       && !xfs_sb_version_hasdirv2(&mp->m_sb);
-}
-
-static int
 inode_u_sfdir2_count(
 	void		*obj,
 	int		startoff)
@@ -547,7 +559,24 @@ inode_u_sfdir2_count(
 	ASSERT((char *)XFS_DFORK_DPTR(dip) - (char *)dip == byteize(startoff));
 	return dip->di_format == XFS_DINODE_FMT_LOCAL &&
 	       (be16_to_cpu(dip->di_mode) & S_IFMT) == S_IFDIR &&
-	       xfs_sb_version_hasdirv2(&mp->m_sb);
+	       xfs_sb_version_hasdirv2(&mp->m_sb) &&
+	       !xfs_sb_version_hasftype(&mp->m_sb);
+}
+
+static int
+inode_u_sfdir3_count(
+	void		*obj,
+	int		startoff)
+{
+	xfs_dinode_t	*dip;
+
+	ASSERT(bitoffs(startoff) == 0);
+	ASSERT(obj == iocur_top->data);
+	dip = obj;
+	ASSERT((char *)XFS_DFORK_DPTR(dip) - (char *)dip == byteize(startoff));
+	return dip->di_format == XFS_DINODE_FMT_LOCAL &&
+	       (be16_to_cpu(dip->di_mode) & S_IFMT) == S_IFDIR &&
+	       xfs_sb_version_hasftype(&mp->m_sb);
 }
 
 int
@@ -594,6 +623,14 @@ inode_u_symlink_count(
 		(int)be64_to_cpu(dip->di_size) : 0;
 }
 
+/*
+ * We are now using libxfs for our IO backend, so we should always try to use
+ * inode cluster buffers rather than filesystem block sized buffers for reading
+ * inodes. This means that we always use the same buffers as libxfs operations
+ * does, and that avoids buffer cache issues caused by overlapping buffers. This
+ * can be seen clearly when trying to read the root inode. Much of this logic is
+ * similar to libxfs_imap().
+ */
 void
 set_cur_inode(
 	xfs_ino_t	ino)
@@ -603,6 +640,9 @@ set_cur_inode(
 	xfs_agnumber_t	agno;
 	xfs_dinode_t	*dip;
 	int		offset;
+	int		numblks = blkbb;
+	xfs_agblock_t	cluster_agbno;
+
 
 	agno = XFS_INO_TO_AGNO(mp, ino);
 	agino = XFS_INO_TO_AGINO(mp, ino);
@@ -615,6 +655,24 @@ set_cur_inode(
 		return;
 	}
 	cur_agno = agno;
+
+	if (mp->m_inode_cluster_size > mp->m_sb.sb_blocksize &&
+	    mp->m_inoalign_mask) {
+		xfs_agblock_t	chunk_agbno;
+		xfs_agblock_t	offset_agbno;
+		int		blks_per_cluster;
+
+		blks_per_cluster = mp->m_inode_cluster_size >>
+							mp->m_sb.sb_blocklog;
+		offset_agbno = agbno & mp->m_inoalign_mask;
+		chunk_agbno = agbno - offset_agbno;
+		cluster_agbno = chunk_agbno +
+			((offset_agbno / blks_per_cluster) * blks_per_cluster);
+		offset += ((agbno - cluster_agbno) * mp->m_sb.sb_inopblock);
+		numblks = XFS_FSB_TO_BB(mp, blks_per_cluster);
+	} else
+		cluster_agbno = agbno;
+
 	/*
 	 * First set_cur to the block with the inode
 	 * then use off_cur to get the right part of the buffer.
@@ -622,10 +680,12 @@ set_cur_inode(
 	ASSERT(typtab[TYP_INODE].typnm == TYP_INODE);
 
 	/* ingore ring update here, do it explicitly below */
-	set_cur(&typtab[TYP_INODE], XFS_AGB_TO_DADDR(mp, agno, agbno),
-		blkbb, DB_RING_IGN, NULL);
+	set_cur(&typtab[TYP_INODE], XFS_AGB_TO_DADDR(mp, agno, cluster_agbno),
+		numblks, DB_RING_IGN, NULL);
 	off_cur(offset << mp->m_sb.sb_inodelog, mp->m_sb.sb_inodesize);
 	dip = iocur_top->data;
+	iocur_top->ino_crc_ok = libxfs_dinode_verify(mp, ino, dip);
+	iocur_top->ino_buf = 1;
 	iocur_top->ino = ino;
 	iocur_top->mode = be16_to_cpu(dip->di_mode);
 	if ((iocur_top->mode & S_IFMT) == S_IFDIR)

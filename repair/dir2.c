@@ -22,18 +22,10 @@
 #include "incore.h"
 #include "err_protos.h"
 #include "dinode.h"
-#include "dir.h"
 #include "dir2.h"
 #include "bmap.h"
 #include "prefetch.h"
 #include "progress.h"
-
-/*
- * Tag bad directory entries with this.
- * We can't tag them with -1 since that will look like a
- * data_unused_t instead of a data_entry_t.
- */
-#define	BADFSINO	((xfs_ino_t)0xfeffffffffffffffULL)
 
 /*
  * Known bad inode list.  These are seen when the leaf and node
@@ -43,9 +35,10 @@ typedef struct dir2_bad {
 	xfs_ino_t	ino;
 	struct dir2_bad	*next;
 } dir2_bad_t;
-dir2_bad_t *dir2_bad_list;
 
-void
+static dir2_bad_t *dir2_bad_list;
+
+static void
 dir2_add_badlist(
 	xfs_ino_t	ino)
 {
@@ -75,185 +68,61 @@ dir2_is_badino(
 }
 
 /*
+ * takes a name and length (name need not be null-terminated)
+ * and returns 1 if the name contains a '/' or a \0, returns 0
+ * otherwise
+ */
+int
+namecheck(char *name, int length)
+{
+	char *c;
+	int i;
+
+	ASSERT(length < MAXNAMELEN);
+
+	for (c = name, i = 0; i < length; i++, c++)  {
+		if (*c == '/' || *c == '\0')
+			return(1);
+	}
+
+	return(0);
+}
+
+/*
  * Multibuffer handling.
  * V2 directory blocks can be noncontiguous, needing multiple buffers.
  */
-xfs_dabuf_t *
+static struct xfs_buf *
 da_read_buf(
 	xfs_mount_t	*mp,
 	int		nex,
-	bmap_ext_t	*bmp)
+	bmap_ext_t	*bmp,
+	const struct xfs_buf_ops *ops)
 {
-	xfs_buf_t	*bp;
-	xfs_buf_t	*bparray[4];
-	xfs_buf_t	**bplist;
-	xfs_dabuf_t	*dabuf;
+#define MAP_ARRAY_SZ 4
+	struct xfs_buf_map map_array[MAP_ARRAY_SZ];
+	struct xfs_buf_map *map;
+	struct xfs_buf	*bp;
 	int		i;
-	int		off;
 
-	if (nex > (sizeof(bparray)/sizeof(xfs_buf_t *))) {
-		bplist = calloc(nex, sizeof(*bplist));
-		if (bplist == NULL) {
+	if (nex > MAP_ARRAY_SZ) {
+		map = calloc(nex, sizeof(*map));
+		if (map == NULL) {
 			do_error(_("couldn't malloc dir2 buffer list\n"));
 			exit(1);
 		}
-	}
-	else {
+	} else {
 		/* common case avoids calloc/free */
-		bplist = bparray;
+		map = map_array;
 	}
 	for (i = 0; i < nex; i++) {
-		pftrace("about to read off %llu (len = %d)",
-			(long long)XFS_FSB_TO_DADDR(mp, bmp[i].startblock),
-			XFS_FSB_TO_BB(mp, bmp[i].blockcount));
-
-		bplist[i] = libxfs_readbuf(mp->m_dev,
-				XFS_FSB_TO_DADDR(mp, bmp[i].startblock),
-				XFS_FSB_TO_BB(mp, bmp[i].blockcount), 0);
-		if (!bplist[i]) {
-			nex = i;
-			goto failed;
-		}
-
-		pftrace("readbuf %p (%llu, %d)", bplist[i],
-			(long long)XFS_BUF_ADDR(bplist[i]),
-			XFS_BUF_COUNT(bplist[i]));
+		map[i].bm_bn = XFS_FSB_TO_DADDR(mp, bmp[i].startblock);
+		map[i].bm_len = XFS_FSB_TO_BB(mp, bmp[i].blockcount);
 	}
-	dabuf = malloc(XFS_DA_BUF_SIZE(nex));
-	if (dabuf == NULL) {
-		do_error(_("couldn't malloc dir2 buffer header\n"));
-		exit(1);
-	}
-	dabuf->dirty = 0;
-	dabuf->nbuf = nex;
-	if (nex == 1) {
-		bp = bplist[0];
-		dabuf->bbcount = (short)BTOBB(XFS_BUF_COUNT(bp));
-		dabuf->data = XFS_BUF_PTR(bp);
-		dabuf->bps[0] = bp;
-	} else {
-		for (i = 0, dabuf->bbcount = 0; i < nex; i++) {
-			dabuf->bps[i] = bp = bplist[i];
-			dabuf->bbcount += BTOBB(XFS_BUF_COUNT(bp));
-		}
-		dabuf->data = malloc(BBTOB(dabuf->bbcount));
-		if (dabuf->data == NULL) {
-			do_error(_("couldn't malloc dir2 buffer data\n"));
-			exit(1);
-		}
-		for (i = off = 0; i < nex; i++, off += XFS_BUF_COUNT(bp)) {
-			bp = bplist[i];
-			memmove((char *)dabuf->data + off, XFS_BUF_PTR(bp),
-				XFS_BUF_COUNT(bp));
-		}
-	}
-	if (bplist != bparray)
-		free(bplist);
-	return dabuf;
-failed:
-	for (i = 0; i < nex; i++)
-		libxfs_putbuf(bplist[i]);
-	if (bplist != bparray)
-		free(bplist);
-	return NULL;
-}
-
-static void
-da_buf_clean(
-	xfs_dabuf_t	*dabuf)
-{
-	xfs_buf_t	*bp;
-	int		i;
-	int		off;
-
-	if (dabuf->dirty) {
-		dabuf->dirty = 0;
-		for (i=off=0; i < dabuf->nbuf; i++, off += XFS_BUF_COUNT(bp)) {
-			bp = dabuf->bps[i];
-			memmove(XFS_BUF_PTR(bp), (char *)dabuf->data + off,
-				XFS_BUF_COUNT(bp));
-		}
-	}
-}
-
-static void
-da_buf_done(
-	xfs_dabuf_t	*dabuf)
-{
-	da_buf_clean(dabuf);
-	if (dabuf->nbuf > 1)
-		free(dabuf->data);
-	free(dabuf);
-}
-
-int
-da_bwrite(
-	xfs_mount_t	*mp,
-	xfs_dabuf_t	*dabuf)
-{
-	xfs_buf_t	*bp;
-	xfs_buf_t	**bplist;
-	int		e;
-	int		error;
-	int		i;
-	int		nbuf;
-	int		off;
-
-	if ((nbuf = dabuf->nbuf) == 1) {
-		bplist = &bp;
-		bp = dabuf->bps[0];
-	} else {
-		bplist = malloc(nbuf * sizeof(*bplist));
-		if (bplist == NULL) {
-			do_error(_("couldn't malloc dir2 buffer list\n"));
-			exit(1);
-		}
-		memmove(bplist, dabuf->bps, nbuf * sizeof(*bplist));
-		for (i = off = 0; i < nbuf; i++, off += XFS_BUF_COUNT(bp)) {
-			bp = bplist[i];
-			memmove(XFS_BUF_PTR(bp), (char *)dabuf->data + off,
-				XFS_BUF_COUNT(bp));
-		}
-	}
-	da_buf_done(dabuf);
-	for (i = error = 0; i < nbuf; i++) {
-		e = libxfs_writebuf(bplist[i], 0);
-		if (e)
-			error = e;
-	}
-	if (bplist != &bp)
-		free(bplist);
-	return error;
-}
-
-void
-da_brelse(
-	xfs_dabuf_t	*dabuf)
-{
-	xfs_buf_t	*bp;
-	xfs_buf_t	**bplist;
-	int		i;
-	int		nbuf;
-
-	if ((nbuf = dabuf->nbuf) == 1) {
-		bplist = &bp;
-		bp = dabuf->bps[0];
-	} else {
-		bplist = malloc(nbuf * sizeof(*bplist));
-		if (bplist == NULL) {
-			do_error(_("couldn't malloc dir2 buffer list\n"));
-			exit(1);
-		}
-		memmove(bplist, dabuf->bps, nbuf * sizeof(*bplist));
-	}
-	da_buf_done(dabuf);
-	for (i = 0; i < nbuf; i++) {
-		pftrace("putbuf %p (%llu)", bplist[i],
-					(long long)XFS_BUF_ADDR(bplist[i]));
-		libxfs_putbuf(bplist[i]);
-	}
-	if (bplist != &bp)
-		free(bplist);
+	bp = libxfs_readbuf_map(mp->m_dev, map, nex, 0, ops);
+	if (map != map_array)
+		free(map);
+	return bp;
 }
 
 /*
@@ -262,19 +131,20 @@ da_brelse(
  * left-most leaf block if successful (bno).  returns 1 if successful,
  * 0 if unsuccessful.
  */
-int
+static int
 traverse_int_dir2block(xfs_mount_t	*mp,
 		dir2_bt_cursor_t	*da_cursor,
 		xfs_dablk_t		*rbno)
 {
 	bmap_ext_t		*bmp;
 	xfs_dablk_t		bno;
-	xfs_dabuf_t		*bp;
+	struct xfs_buf		*bp;
 	int			i;
 	int			nex;
-	xfs_da_blkinfo_t	*info;
 	xfs_da_intnode_t	*node;
 	bmap_ext_t		lbmp;
+	struct xfs_da_node_entry *btree;
+	struct xfs_da3_icnode_hdr nodehdr;
 
 	/*
 	 * traverse down left-side of tree until we hit the
@@ -283,7 +153,7 @@ traverse_int_dir2block(xfs_mount_t	*mp,
 	 */
 	bno = mp->m_dirleafblk;
 	i = -1;
-	info = NULL;
+	node = NULL;
 	da_cursor->active = 0;
 
 	do {
@@ -296,7 +166,7 @@ traverse_int_dir2block(xfs_mount_t	*mp,
 		if (nex == 0)
 			goto error_out;
 
-		bp = da_read_buf(mp, nex, bmp);
+		bp = da_read_buf(mp, nex, bmp, &xfs_da3_node_buf_ops);
 		if (bmp != &lbmp)
 			free(bmp);
 		if (bp == NULL) {
@@ -306,31 +176,35 @@ _("can't read block %u for directory inode %" PRIu64 "\n"),
 			goto error_out;
 		}
 
-		info = bp->data;
+		node = bp->b_addr;
+		xfs_da3_node_hdr_from_disk(&nodehdr, node);
 
-		if (be16_to_cpu(info->magic) == XFS_DIR2_LEAFN_MAGIC)  {
+		if (nodehdr.magic == XFS_DIR2_LEAFN_MAGIC ||
+		    nodehdr.magic == XFS_DIR3_LEAFN_MAGIC)  {
 			if ( i != -1 ) {
 				do_warn(
 _("found non-root LEAFN node in inode %" PRIu64 " bno = %u\n"),
 					da_cursor->ino, bno);
 			}
 			*rbno = 0;
-			da_brelse(bp);
+			libxfs_putbuf(bp);
 			return(1);
-		} else if (be16_to_cpu(info->magic) != XFS_DA_NODE_MAGIC)  {
-			da_brelse(bp);
+		} else if (!(nodehdr.magic == XFS_DA_NODE_MAGIC ||
+			     nodehdr.magic == XFS_DA3_NODE_MAGIC))  {
+			libxfs_putbuf(bp);
 			do_warn(
 _("bad dir magic number 0x%x in inode %" PRIu64 " bno = %u\n"),
-				be16_to_cpu(info->magic),
+					nodehdr.magic,
 					da_cursor->ino, bno);
 			goto error_out;
 		}
-		node = (xfs_da_intnode_t*)info;
-		if (be16_to_cpu(node->hdr.count) > mp->m_dir_node_ents)  {
-			da_brelse(bp);
+		btree = xfs_da3_node_tree_p(node);
+		if (nodehdr.count > mp->m_dir_node_ents)  {
+			libxfs_putbuf(bp);
 			do_warn(
-_("bad record count in inode %" PRIu64 ", count = %d, max = %d\n"), da_cursor->ino,
-				be16_to_cpu(node->hdr.count),
+_("bad record count in inode %" PRIu64 ", count = %d, max = %d\n"),
+				da_cursor->ino,
+				nodehdr.count,
 				mp->m_dir_node_ents);
 			goto error_out;
 		}
@@ -338,29 +212,28 @@ _("bad record count in inode %" PRIu64 ", count = %d, max = %d\n"), da_cursor->i
 		 * maintain level counter
 		 */
 		if (i == -1) {
-			i = da_cursor->active = be16_to_cpu(node->hdr.level);
-			if (i >= XFS_DA_NODE_MAXDEPTH) {
+			i = da_cursor->active = nodehdr.level;
+			if (i < 1 || i >= XFS_DA_NODE_MAXDEPTH) {
 				do_warn(
 _("bad header depth for directory inode %" PRIu64 "\n"),
 					da_cursor->ino);
-				da_brelse(bp);
+				libxfs_putbuf(bp);
 				i = -1;
 				goto error_out;
 			}
 		} else {
-			if (be16_to_cpu(node->hdr.level) == i - 1)  {
+			if (nodehdr.level == i - 1)  {
 				i--;
 			} else  {
 				do_warn(
 _("bad directory btree for directory inode %" PRIu64 "\n"),
 					da_cursor->ino);
-				da_brelse(bp);
+				libxfs_putbuf(bp);
 				goto error_out;
 			}
 		}
 
-		da_cursor->level[i].hashval =
-					be32_to_cpu(node->btree[0].hashval);
+		da_cursor->level[i].hashval = be32_to_cpu(btree[0].hashval);
 		da_cursor->level[i].bp = bp;
 		da_cursor->level[i].bno = bno;
 		da_cursor->level[i].index = 0;
@@ -368,8 +241,8 @@ _("bad directory btree for directory inode %" PRIu64 "\n"),
 		/*
 		 * set up new bno for next level down
 		 */
-		bno = be32_to_cpu(node->btree[0].before);
-	} while (info != NULL && i > 1);
+		bno = be32_to_cpu(btree[0].before);
+	} while (node != NULL && i > 1);
 
 	/*
 	 * now return block number and get out
@@ -379,7 +252,7 @@ _("bad directory btree for directory inode %" PRIu64 "\n"),
 
 error_out:
 	while (i > 1 && i <= da_cursor->active)  {
-		da_brelse(da_cursor->level[i].bp);
+		libxfs_putbuf(da_cursor->level[i].bp);
 		i++;
 	}
 
@@ -392,7 +265,7 @@ error_out:
  * buffers (e.g. if we do, it's a mistake).  if error == 1, we're
  * in an error-handling case so unreleased buffers may exist.
  */
-void
+static void
 release_dir2_cursor_int(xfs_mount_t		*mp,
 			dir2_bt_cursor_t	*cursor,
 			int			prev_level,
@@ -408,7 +281,7 @@ release_dir2_cursor_int(xfs_mount_t		*mp,
 		}
 		ASSERT(error != 0);
 
-		da_brelse(cursor->level[level].bp);
+		libxfs_putbuf(cursor->level[level].bp);
 		cursor->level[level].bp = NULL;
 	}
 
@@ -418,7 +291,7 @@ release_dir2_cursor_int(xfs_mount_t		*mp,
 	return;
 }
 
-void
+static void
 release_dir2_cursor(xfs_mount_t		*mp,
 		dir2_bt_cursor_t	*cursor,
 		int			prev_level)
@@ -426,7 +299,7 @@ release_dir2_cursor(xfs_mount_t		*mp,
 	release_dir2_cursor_int(mp, cursor, prev_level, 0);
 }
 
-void
+static void
 err_release_dir2_cursor(xfs_mount_t		*mp,
 			dir2_bt_cursor_t	*cursor,
 			int			prev_level)
@@ -442,7 +315,7 @@ err_release_dir2_cursor(xfs_mount_t		*mp,
  * technically a block boundary.  This routine should be used then
  * instead of verify_dir2_path().
  */
-int
+static int
 verify_final_dir2_path(xfs_mount_t	*mp,
 		dir2_bt_cursor_t	*cursor,
 		const int		p_level)
@@ -451,39 +324,43 @@ verify_final_dir2_path(xfs_mount_t	*mp,
 	int			bad = 0;
 	int			entry;
 	int			this_level = p_level + 1;
+	struct xfs_da_node_entry *btree;
+	struct xfs_da3_icnode_hdr nodehdr;
 
 	/*
 	 * the index should point to the next "unprocessed" entry
 	 * in the block which should be the final (rightmost) entry
 	 */
 	entry = cursor->level[this_level].index;
-	node = (xfs_da_intnode_t *)(cursor->level[this_level].bp->data);
+	node = (xfs_da_intnode_t *)(cursor->level[this_level].bp->b_addr);
+	btree = xfs_da3_node_tree_p(node);
+	xfs_da3_node_hdr_from_disk(&nodehdr, node);
 	/*
 	 * check internal block consistency on this level -- ensure
 	 * that all entries are used, encountered and expected hashvals
 	 * match, etc.
 	 */
-	if (entry != be16_to_cpu(node->hdr.count) - 1)  {
+	if (entry != nodehdr.count - 1)  {
 		do_warn(
 		_("directory block used/count inconsistency - %d / %hu\n"),
-			entry, be16_to_cpu(node->hdr.count));
+			entry, nodehdr.count);
 		bad++;
 	}
 	/*
 	 * hash values monotonically increasing ???
 	 */
 	if (cursor->level[this_level].hashval >=
-				be32_to_cpu(node->btree[entry].hashval))  {
+				be32_to_cpu(btree[entry].hashval))  {
 		do_warn(_("directory/attribute block hashvalue inconsistency, "
 			  "expected > %u / saw %u\n"),
 			cursor->level[this_level].hashval,
-			be32_to_cpu(node->btree[entry].hashval));
+			be32_to_cpu(btree[entry].hashval));
 		bad++;
 	}
-	if (be32_to_cpu(node->hdr.info.forw) != 0)  {
+	if (nodehdr.forw != 0)  {
 		do_warn(_("bad directory/attribute forward block pointer, "
 			  "expected 0, saw %u\n"),
-			be32_to_cpu(node->hdr.info.forw));
+			nodehdr.forw);
 		bad++;
 	}
 	if (bad)  {
@@ -500,18 +377,17 @@ verify_final_dir2_path(xfs_mount_t	*mp,
 	/*
 	 * ok, now check descendant block number against this level
 	 */
-	if (cursor->level[p_level].bno !=
-				be32_to_cpu(node->btree[entry].before))
+	if (cursor->level[p_level].bno != be32_to_cpu(btree[entry].before))
 		return(1);
 
 	if (cursor->level[p_level].hashval !=
-				be32_to_cpu(node->btree[entry].hashval))  {
+				be32_to_cpu(btree[entry].hashval))  {
 		if (!no_modify)  {
 			do_warn(
 _("correcting bad hashval in non-leaf dir block\n"
   "\tin (level %d) in inode %" PRIu64 ".\n"),
 				this_level, cursor->ino);
-			node->btree[entry].hashval = cpu_to_be32(
+			btree[entry].hashval = cpu_to_be32(
 						cursor->level[p_level].hashval);
 			cursor->level[this_level].dirty++;
 		} else  {
@@ -529,9 +405,9 @@ _("would correct bad hashval in non-leaf dir block\n"
 		(cursor->level[this_level].dirty && !no_modify));
 
 	if (cursor->level[this_level].dirty && !no_modify)
-		da_bwrite(mp, cursor->level[this_level].bp);
+		libxfs_writebuf(cursor->level[this_level].bp, 0);
 	else
-		da_brelse(cursor->level[this_level].bp);
+		libxfs_putbuf(cursor->level[this_level].bp);
 
 	cursor->level[this_level].bp = NULL;
 
@@ -544,8 +420,7 @@ _("would correct bad hashval in non-leaf dir block\n"
 	 * set hashvalue to correctl reflect the now-validated
 	 * last entry in this block and continue upwards validation
 	 */
-	cursor->level[this_level].hashval =
-		be32_to_cpu(node->btree[entry].hashval);
+	cursor->level[this_level].hashval = be32_to_cpu(btree[entry].hashval);
 
 	return(verify_final_dir2_path(mp, cursor, this_level));
 }
@@ -589,7 +464,7 @@ _("would correct bad hashval in non-leaf dir block\n"
  * since they have to be set so we can get a buffer for the
  * block.
  */
-int
+static int
 verify_dir2_path(xfs_mount_t	*mp,
 	dir2_bt_cursor_t	*cursor,
 	const int		p_level)
@@ -597,34 +472,38 @@ verify_dir2_path(xfs_mount_t	*mp,
 	xfs_da_intnode_t	*node;
 	xfs_da_intnode_t	*newnode;
 	xfs_dablk_t		dabno;
-	xfs_dabuf_t		*bp;
+	struct xfs_buf		*bp;
 	int			bad;
 	int			entry;
 	int			this_level = p_level + 1;
 	bmap_ext_t		*bmp;
 	int			nex;
 	bmap_ext_t		lbmp;
+	struct xfs_da_node_entry *btree;
+	struct xfs_da3_icnode_hdr nodehdr;
 
 	/*
 	 * index is currently set to point to the entry that
 	 * should be processed now in this level.
 	 */
 	entry = cursor->level[this_level].index;
-	node = cursor->level[this_level].bp->data;
+	node = cursor->level[this_level].bp->b_addr;
+	btree = xfs_da3_node_tree_p(node);
+	xfs_da3_node_hdr_from_disk(&nodehdr, node);
 
 	/*
 	 * if this block is out of entries, validate this
 	 * block and move on to the next block.
 	 * and update cursor value for said level
 	 */
-	if (entry >= be16_to_cpu(node->hdr.count))  {
+	if (entry >= nodehdr.count)  {
 		/*
 		 * update the hash value for this level before
 		 * validating it.  bno value should be ok since
 		 * it was set when the block was first read in.
 		 */
 		cursor->level[this_level].hashval =
-			be32_to_cpu(node->btree[entry - 1].hashval);
+			be32_to_cpu(btree[entry - 1].hashval);
 
 		/*
 		 * keep track of greatest block # -- that gets
@@ -642,7 +521,7 @@ verify_dir2_path(xfs_mount_t	*mp,
 		/*
 		 * ok, now get the next buffer and check sibling pointers
 		 */
-		dabno = be32_to_cpu(node->hdr.info.forw);
+		dabno = nodehdr.forw;
 		ASSERT(dabno != 0);
 		nex = blkmap_getn(cursor->blkmap, dabno, mp->m_dirblkfsbs,
 			&bmp, &lbmp);
@@ -653,7 +532,7 @@ _("can't get map info for block %u of directory inode %" PRIu64 "\n"),
 			return(1);
 		}
 
-		bp = da_read_buf(mp, nex, bmp);
+		bp = da_read_buf(mp, nex, bmp, &xfs_da3_node_buf_ops);
 		if (bmp != &lbmp)
 			free(bmp);
 
@@ -664,42 +543,44 @@ _("can't read block %u for directory inode %" PRIu64 "\n"),
 			return(1);
 		}
 
-		newnode = bp->data;
+		newnode = bp->b_addr;
+		btree = xfs_da3_node_tree_p(newnode);
+		xfs_da3_node_hdr_from_disk(&nodehdr, newnode);
 		/*
 		 * verify magic number and back pointer, sanity-check
 		 * entry count, verify level
 		 */
 		bad = 0;
-		if (XFS_DA_NODE_MAGIC != be16_to_cpu(newnode->hdr.info.magic)) {
+		if (!(nodehdr.magic == XFS_DA_NODE_MAGIC ||
+		      nodehdr.magic == XFS_DA3_NODE_MAGIC)) {
 			do_warn(
 _("bad magic number %x in block %u for directory inode %" PRIu64 "\n"),
-				be16_to_cpu(newnode->hdr.info.magic),
+				nodehdr.magic,
 				dabno, cursor->ino);
 			bad++;
 		}
-		if (be32_to_cpu(newnode->hdr.info.back) !=
-					cursor->level[this_level].bno)  {
+		if (nodehdr.back != cursor->level[this_level].bno)  {
 			do_warn(
 _("bad back pointer in block %u for directory inode %" PRIu64 "\n"),
 				dabno, cursor->ino);
 			bad++;
 		}
-		if (be16_to_cpu(newnode->hdr.count) > mp->m_dir_node_ents)  {
+		if (nodehdr.count > mp->m_dir_node_ents)  {
 			do_warn(
 _("entry count %d too large in block %u for directory inode %" PRIu64 "\n"),
-				be16_to_cpu(newnode->hdr.count),
+				nodehdr.count,
 				dabno, cursor->ino);
 			bad++;
 		}
-		if (be16_to_cpu(newnode->hdr.level) != this_level)  {
+		if (nodehdr.level != this_level)  {
 			do_warn(
 _("bad level %d in block %u for directory inode %" PRIu64 "\n"),
-				be16_to_cpu(newnode->hdr.level),
+				nodehdr.level,
 				dabno, cursor->ino);
 			bad++;
 		}
 		if (bad)  {
-			da_brelse(bp);
+			libxfs_putbuf(bp);
 			return(1);
 		}
 		/*
@@ -708,38 +589,42 @@ _("bad level %d in block %u for directory inode %" PRIu64 "\n"),
 		 */
 		ASSERT(cursor->level[this_level].dirty == 0 ||
 			(cursor->level[this_level].dirty && !no_modify));
-
+		/*
+		 * If block looks ok but CRC didn't match, make sure to
+		 * recompute it.
+		 */
+		if (!no_modify &&
+		    cursor->level[this_level].bp->b_error == EFSBADCRC)
+			cursor->level[this_level].dirty = 1;
 		if (cursor->level[this_level].dirty && !no_modify)
-			da_bwrite(mp, cursor->level[this_level].bp);
+			libxfs_writebuf(cursor->level[this_level].bp, 0);
 		else
-			da_brelse(cursor->level[this_level].bp);
+			libxfs_putbuf(cursor->level[this_level].bp);
 		cursor->level[this_level].bp = bp;
 		cursor->level[this_level].dirty = 0;
 		cursor->level[this_level].bno = dabno;
 		cursor->level[this_level].hashval =
-			be32_to_cpu(newnode->btree[0].hashval);
-		node = newnode;
+			be32_to_cpu(btree[0].hashval);
 
 		entry = cursor->level[this_level].index = 0;
 	}
 	/*
 	 * ditto for block numbers
 	 */
-	if (cursor->level[p_level].bno !=
-				be32_to_cpu(node->btree[entry].before))
+	if (cursor->level[p_level].bno != be32_to_cpu(btree[entry].before))
 		return(1);
 	/*
 	 * ok, now validate last hashvalue in the descendant
 	 * block against the hashval in the current entry
 	 */
 	if (cursor->level[p_level].hashval !=
-				be32_to_cpu(node->btree[entry].hashval))  {
+				be32_to_cpu(btree[entry].hashval))  {
 		if (!no_modify)  {
 			do_warn(
 _("correcting bad hashval in interior dir block\n"
   "\tin (level %d) in inode %" PRIu64 ".\n"),
 				this_level, cursor->ino);
-			node->btree[entry].hashval = cpu_to_be32(
+			btree[entry].hashval = cpu_to_be32(
 					cursor->level[p_level].hashval);
 			cursor->level[this_level].dirty++;
 		} else  {
@@ -764,13 +649,14 @@ _("would correct bad hashval in interior dir block\n"
  */
 void
 process_sf_dir2_fixi8(
-	xfs_dir2_sf_t		*sfp,
+	struct xfs_mount	*mp,
+	struct xfs_dir2_sf_hdr	*sfp,
 	xfs_dir2_sf_entry_t	**next_sfep)
 {
 	xfs_ino_t		ino;
-	xfs_dir2_sf_t		*newsfp;
+	struct xfs_dir2_sf_hdr	*newsfp;
 	xfs_dir2_sf_entry_t	*newsfep;
-	xfs_dir2_sf_t		*oldsfp;
+	struct xfs_dir2_sf_hdr	*oldsfp;
 	xfs_dir2_sf_entry_t	*oldsfep;
 	int			oldsize;
 
@@ -782,10 +668,10 @@ process_sf_dir2_fixi8(
 		exit(1);
 	}
 	memmove(oldsfp, newsfp, oldsize);
-	newsfp->hdr.count = oldsfp->hdr.count;
-	newsfp->hdr.i8count = 0;
-	ino = xfs_dir2_sf_get_inumber(oldsfp, &oldsfp->hdr.parent);
-	xfs_dir2_sf_put_inumber(newsfp, &ino, &newsfp->hdr.parent);
+	newsfp->count = oldsfp->count;
+	newsfp->i8count = 0;
+	ino = xfs_dir2_sf_get_parent_ino(sfp);
+	xfs_dir2_sf_put_parent_ino(newsfp, ino);
 	oldsfep = xfs_dir2_sf_firstentry(oldsfp);
 	newsfep = xfs_dir2_sf_firstentry(newsfp);
 	while ((int)((char *)oldsfep - (char *)oldsfp) < oldsize) {
@@ -793,12 +679,10 @@ process_sf_dir2_fixi8(
 		xfs_dir2_sf_put_offset(newsfep,
 			xfs_dir2_sf_get_offset(oldsfep));
 		memmove(newsfep->name, oldsfep->name, newsfep->namelen);
-		ino = xfs_dir2_sf_get_inumber(oldsfp,
-			xfs_dir2_sf_inumberp(oldsfep));
-		xfs_dir2_sf_put_inumber(newsfp, &ino,
-			xfs_dir2_sf_inumberp(newsfep));
-		oldsfep = xfs_dir2_sf_nextentry(oldsfp, oldsfep);
-		newsfep = xfs_dir2_sf_nextentry(newsfp, newsfep);
+		ino = xfs_dir3_sfe_get_ino(mp, oldsfp, oldsfep);
+		xfs_dir3_sfe_put_ino(mp, newsfp, newsfep, ino);
+		oldsfep = xfs_dir3_sf_nextentry(mp, oldsfp, oldsfep);
+		newsfep = xfs_dir3_sf_nextentry(mp, newsfp, newsfep);
 	}
 	*next_sfep = newsfep;
 	free(oldsfp);
@@ -809,21 +693,22 @@ process_sf_dir2_fixi8(
  */
 static void
 process_sf_dir2_fixoff(
+	xfs_mount_t	*mp,
 	xfs_dinode_t	*dip)
 {
 	int			i;
 	int			offset;
 	xfs_dir2_sf_entry_t	*sfep;
-	xfs_dir2_sf_t		*sfp;
+	struct xfs_dir2_sf_hdr	*sfp;
 
-	sfp = (xfs_dir2_sf_t *)XFS_DFORK_DPTR(dip);
+	sfp = (struct xfs_dir2_sf_hdr *)XFS_DFORK_DPTR(dip);
 	sfep = xfs_dir2_sf_firstentry(sfp);
-	offset = XFS_DIR2_DATA_FIRST_OFFSET;
+	offset = xfs_dir3_data_first_offset(mp);
 
-	for (i = 0; i < sfp->hdr.count; i++) {
+	for (i = 0; i < sfp->count; i++) {
 		xfs_dir2_sf_put_offset(sfep, offset);
-		offset += xfs_dir2_data_entsize(sfep->namelen);
-		sfep = xfs_dir2_sf_nextentry(sfp, sfep);
+		offset += xfs_dir3_data_entsize(mp, sfep->namelen);
+		sfep = xfs_dir3_sf_nextentry(mp, sfp, sfep);
 	}
 }
 
@@ -861,18 +746,18 @@ process_sf_dir2(
 	xfs_dir2_sf_entry_t	*next_sfep;
 	int			num_entries;
 	int			offset;
-	xfs_dir2_sf_t		*sfp;
+	struct xfs_dir2_sf_hdr	*sfp;
 	xfs_dir2_sf_entry_t	*sfep;
 	int			tmp_elen;
 	int			tmp_len;
 	xfs_dir2_sf_entry_t	*tmp_sfep;
 	xfs_ino_t		zero = 0;
 
-	sfp = (xfs_dir2_sf_t *)XFS_DFORK_DPTR(dip);
+	sfp = (struct xfs_dir2_sf_hdr *)XFS_DFORK_DPTR(dip);
 	max_size = XFS_DFORK_DSIZE(dip, mp);
-	num_entries = sfp->hdr.count;
+	num_entries = sfp->count;
 	ino_dir_size = be64_to_cpu(dip->di_size);
-	offset = XFS_DIR2_DATA_FIRST_OFFSET;
+	offset = xfs_dir3_data_first_offset(mp);
 	bad_offset = *repair = 0;
 
 	ASSERT(ino_dir_size <= max_size);
@@ -880,13 +765,12 @@ process_sf_dir2(
 	/*
 	 * Initialize i8 based on size of parent inode number.
 	 */
-	i8 = (xfs_dir2_sf_get_inumber(sfp, &sfp->hdr.parent)
-		> XFS_DIR2_MAX_SHORT_INUM);
+	i8 = (xfs_dir2_sf_get_parent_ino(sfp) > XFS_DIR2_MAX_SHORT_INUM);
 
 	/*
 	 * check for bad entry count
 	 */
-	if (num_entries * xfs_dir2_sf_entsize_byname(sfp, 1) +
+	if (num_entries * xfs_dir3_sf_entsize(mp, sfp, 1) +
 		    xfs_dir2_sf_hdr_size(0) > max_size || num_entries == 0)
 		num_entries = 0xFF;
 
@@ -894,7 +778,7 @@ process_sf_dir2(
 	 * run through entries, stop at first bad entry, don't need
 	 * to check for .. since that's encoded in its own field
 	 */
-	sfep = next_sfep = xfs_dir2_sf_firstentry(sfp);
+	next_sfep = xfs_dir2_sf_firstentry(sfp);
 	for (i = 0;
 	     i < num_entries && ino_dir_size > (char *)next_sfep - (char *)sfp;
 	     i++) {
@@ -902,7 +786,7 @@ process_sf_dir2(
 		sfep = next_sfep;
 		junkit = 0;
 		bad_sfnamelen = 0;
-		lino = xfs_dir2_sf_get_inumber(sfp, xfs_dir2_sf_inumberp(sfep));
+		lino = xfs_dir3_sfe_get_ino(mp, sfp, sfep);
 		/*
 		 * if entry points to self, junk it since only '.' or '..'
 		 * should do that and shortform dirs don't contain either
@@ -932,6 +816,9 @@ process_sf_dir2(
 		} else if (lino == mp->m_sb.sb_gquotino)  {
 			junkit = 1;
 			junkreason = _("group quota");
+		} else if (lino == mp->m_sb.sb_pquotino)  {
+			junkit = 1;
+			junkreason = _("project quota");
 		} else if ((irec_p = find_inode_rec(mp,
 					XFS_INO_TO_AGNO(mp, lino),
 					XFS_INO_TO_AGINO(mp, lino))) != NULL) {
@@ -1016,7 +903,7 @@ _("zero length entry in shortform dir %" PRIu64 ""),
 				break;
 			}
 		} else if ((__psint_t) sfep - (__psint_t) sfp +
-				xfs_dir2_sf_entsize_byentry(sfp, sfep)
+				xfs_dir3_sf_entsize(mp, sfp, sfep->namelen)
 							> ino_dir_size)  {
 			bad_sfnamelen = 1;
 
@@ -1087,7 +974,7 @@ _("entry contains offset out of order in shortform dir %" PRIu64 "\n"),
 			bad_offset = 1;
 		}
 		offset = xfs_dir2_sf_get_offset(sfep) +
-						xfs_dir2_data_entsize(namelen);
+					xfs_dir3_data_entsize(mp, namelen);
 
 		/*
 		 * junk the entry by copying up the rest of the
@@ -1104,8 +991,8 @@ _("entry contains offset out of order in shortform dir %" PRIu64 "\n"),
 			name[namelen] = '\0';
 
 			if (!no_modify)  {
-				tmp_elen =
-					xfs_dir2_sf_entsize_byentry(sfp, sfep);
+				tmp_elen = xfs_dir3_sf_entsize(mp, sfp,
+								sfep->namelen);
 				be64_add_cpu(&dip->di_size, -tmp_elen);
 				ino_dir_size -= tmp_elen;
 
@@ -1116,7 +1003,7 @@ _("entry contains offset out of order in shortform dir %" PRIu64 "\n"),
 
 				memmove(sfep, tmp_sfep, tmp_len);
 
-				sfp->hdr.count -= 1;
+				sfp->count -= 1;
 				num_entries--;
 				memset((void *) ((__psint_t) sfep + tmp_len), 0,
 					tmp_elen);
@@ -1157,44 +1044,42 @@ _("would have junked entry \"%s\" in directory inode %" PRIu64 "\n"),
 		 */
 		next_sfep = (tmp_sfep == NULL)
 			? (xfs_dir2_sf_entry_t *) ((__psint_t) sfep
-				+ ((!bad_sfnamelen)
-					? xfs_dir2_sf_entsize_byentry(sfp,
-						sfep)
-					: xfs_dir2_sf_entsize_byname(sfp,
-						namelen)))
+							+ ((!bad_sfnamelen)
+				? xfs_dir3_sf_entsize(mp, sfp, sfep->namelen)
+				: xfs_dir3_sf_entsize(mp, sfp, namelen)))
 			: tmp_sfep;
 	}
 
 	/* sync up sizes and entry counts */
 
-	if (sfp->hdr.count != i) {
+	if (sfp->count != i) {
 		if (no_modify) {
 			do_warn(
 _("would have corrected entry count in directory %" PRIu64 " from %d to %d\n"),
-				ino, sfp->hdr.count, i);
+				ino, sfp->count, i);
 		} else {
 			do_warn(
 _("corrected entry count in directory %" PRIu64 ", was %d, now %d\n"),
-				ino, sfp->hdr.count, i);
-			sfp->hdr.count = i;
+				ino, sfp->count, i);
+			sfp->count = i;
 			*dino_dirty = 1;
 			*repair = 1;
 		}
 	}
 
-	if (sfp->hdr.i8count != i8)  {
+	if (sfp->i8count != i8)  {
 		if (no_modify)  {
 			do_warn(
 _("would have corrected i8 count in directory %" PRIu64 " from %d to %d\n"),
-				ino, sfp->hdr.i8count, i8);
+				ino, sfp->i8count, i8);
 		} else {
 			do_warn(
 _("corrected i8 count in directory %" PRIu64 ", was %d, now %d\n"),
-				ino, sfp->hdr.i8count, i8);
+				ino, sfp->i8count, i8);
 			if (i8 == 0)
-				process_sf_dir2_fixi8(sfp, &next_sfep);
+				process_sf_dir2_fixi8(mp, sfp, &next_sfep);
 			else
-				sfp->hdr.i8count = i8;
+				sfp->i8count = i8;
 			*dino_dirty = 1;
 			*repair = 1;
 		}
@@ -1218,7 +1103,7 @@ _("corrected directory %" PRIu64 " size, was %" PRId64 ", now %" PRIdPTR "\n"),
 			*repair = 1;
 		}
 	}
-	if (offset + (sfp->hdr.count + 2) * sizeof(xfs_dir2_leaf_entry_t) +
+	if (offset + (sfp->count + 2) * sizeof(xfs_dir2_leaf_entry_t) +
 			sizeof(xfs_dir2_block_tail_t) > mp->m_dirblksize) {
 		do_warn(_("directory %" PRIu64 " offsets too high\n"), ino);
 		bad_offset = 1;
@@ -1232,7 +1117,7 @@ _("would have corrected entry offsets in directory %" PRIu64 "\n"),
 			do_warn(
 _("corrected entry offsets in directory %" PRIu64 "\n"),
 				ino);
-			process_sf_dir2_fixoff(dip);
+			process_sf_dir2_fixoff(mp, dip);
 			*dino_dirty = 1;
 			*repair = 1;
 		}
@@ -1241,7 +1126,7 @@ _("corrected entry offsets in directory %" PRIu64 "\n"),
 	/*
 	 * check parent (..) entry
 	 */
-	*parent = xfs_dir2_sf_get_inumber(sfp, &sfp->hdr.parent);
+	*parent = xfs_dir2_sf_get_parent_ino(sfp);
 
 	/*
 	 * if parent entry is bogus, null it out.  we'll fix it later .
@@ -1255,7 +1140,7 @@ _("bogus .. inode number (%" PRIu64 ") in directory inode %" PRIu64 ", "),
 		if (!no_modify)  {
 			do_warn(_("clearing inode number\n"));
 
-			xfs_dir2_sf_put_inumber(sfp, &zero, &sfp->hdr.parent);
+			xfs_dir2_sf_put_parent_ino(sfp, zero);
 			*dino_dirty = 1;
 			*repair = 1;
 		} else  {
@@ -1270,7 +1155,7 @@ _("bogus .. inode number (%" PRIu64 ") in directory inode %" PRIu64 ", "),
 _("corrected root directory %" PRIu64 " .. entry, was %" PRIu64 ", now %" PRIu64 "\n"),
 				ino, *parent, ino);
 			*parent = ino;
-			xfs_dir2_sf_put_inumber(sfp, parent, &sfp->hdr.parent);
+			xfs_dir2_sf_put_parent_ino(sfp, ino);
 			*dino_dirty = 1;
 			*repair = 1;
 		} else  {
@@ -1290,7 +1175,7 @@ _("bad .. entry in directory inode %" PRIu64 ", points to self, "),
 		if (!no_modify)  {
 			do_warn(_("clearing inode number\n"));
 
-			xfs_dir2_sf_put_inumber(sfp, &zero, &sfp->hdr.parent);
+			xfs_dir2_sf_put_parent_ino(sfp, zero);
 			*dino_dirty = 1;
 			*repair = 1;
 		} else  {
@@ -1313,17 +1198,18 @@ process_dir2_data(
 	int		ino_discovery,
 	char		*dirname,	/* directory pathname */
 	xfs_ino_t	*parent,	/* out - NULLFSINO if entry not exist */
-	xfs_dabuf_t	*bp,
+	struct xfs_buf	*bp,
 	int		*dot,		/* out - 1 if there is a dot, else 0 */
 	int		*dotdot,	/* out - 1 if there's a dotdot, else 0 */
 	xfs_dablk_t	da_bno,
-	char		*endptr)
+	char		*endptr,
+	int		*dirty)
 {
 	int			badbest;
 	xfs_dir2_data_free_t	*bf;
 	int			clearino;
 	char			*clearreason = NULL;
-	xfs_dir2_data_t		*d;
+	struct xfs_dir2_data_hdr *d;
 	xfs_dir2_data_entry_t	*dep;
 	xfs_dir2_data_free_t	*dfp;
 	xfs_dir2_data_unused_t	*dup;
@@ -1337,9 +1223,9 @@ process_dir2_data(
 	char			*ptr;
 	xfs_ino_t		ent_ino;
 
-	d = bp->data;
-	bf = d->hdr.bestfree;
-	ptr = (char *)d->u;
+	d = bp->b_addr;
+	bf = xfs_dir3_data_bestfree_p(d);
+	ptr = (char *)xfs_dir3_data_entry_p(d);
 	badbest = lastfree = freeseen = 0;
 	if (be16_to_cpu(bf[0].length) == 0) {
 		badbest |= be16_to_cpu(bf[0].offset) != 0;
@@ -1384,12 +1270,12 @@ process_dir2_data(
 			continue;
 		}
 		dep = (xfs_dir2_data_entry_t *)ptr;
-		if (ptr + xfs_dir2_data_entsize(dep->namelen) > endptr)
+		if (ptr + xfs_dir3_data_entsize(mp, dep->namelen) > endptr)
 			break;
-		if (be16_to_cpu(*xfs_dir2_data_entry_tag_p(dep)) !=
+		if (be16_to_cpu(*xfs_dir3_data_entry_tag_p(mp, dep)) !=
 		    				(char *)dep - (char *)d)
 			break;
-		ptr += xfs_dir2_data_entsize(dep->namelen);
+		ptr += xfs_dir3_data_entsize(mp, dep->namelen);
 		lastfree = 0;
 	}
 	/*
@@ -1405,7 +1291,7 @@ process_dir2_data(
 			do_warn(_("\twould junk block\n"));
 		return 1;
 	}
-	ptr = (char *)d->u;
+	ptr = (char *)xfs_dir3_data_entry_p(d);
 	/*
 	 * Process the entries now.
 	 */
@@ -1427,7 +1313,7 @@ process_dir2_data(
 		 * Conditions must either set clearino to zero or set
 		 * clearreason why it's being cleared.
 		 */
-		if (!ino_discovery && ent_ino == BADFSINO) {
+		if (!ino_discovery && dep->name[0] == '/') {
 			/*
 			 * Don't do a damned thing.  We already found this
 			 * (or did it ourselves) during phase 3.
@@ -1448,6 +1334,8 @@ process_dir2_data(
 			clearreason = _("user quota");
 		} else if (ent_ino == mp->m_sb.sb_gquotino) {
 			clearreason = _("group quota");
+		} else if (ent_ino == mp->m_sb.sb_pquotino) {
+			clearreason = _("project quota");
 		} else {
 			irec_p = find_inode_rec(mp,
 						XFS_INO_TO_AGNO(mp, ent_ino),
@@ -1512,9 +1400,8 @@ _("entry at block %u offset %" PRIdPTR " in directory inode %" PRIu64
 				do_warn(
 _("\tclearing inode number in entry at offset %" PRIdPTR "...\n"),
 					(intptr_t)ptr - (intptr_t)d);
-				dep->inumber = cpu_to_be64(BADFSINO);
-				ent_ino = BADFSINO;
-				bp->dirty = 1;
+				dep->name[0] = '/';
+				*dirty = 1;
 			} else {
 				do_warn(
 _("\twould clear inode number in entry at offset %" PRIdPTR "...\n"),
@@ -1526,7 +1413,7 @@ _("\twould clear inode number in entry at offset %" PRIdPTR "...\n"),
 		 * discovery is turned on).  Otherwise, we'd complain a lot
 		 * during phase 4.
 		 */
-		junkit = ent_ino == BADFSINO;
+		junkit = dep->name[0] == '/';
 		nm_illegal = namecheck((char *)dep->name, dep->namelen);
 		if (ino_discovery && nm_illegal) {
 			do_warn(
@@ -1535,14 +1422,15 @@ _("entry at block %u offset %" PRIdPTR " in directory inode %" PRIu64 " has ille
 				dep->namelen, dep->namelen, dep->name);
 			junkit = 1;
 		}
+
 		/*
-		 * Now we can mark entries with BADFSINO's bad.
+		 * Ensure we write back bad entries for later processing
 		 */
-		if (!no_modify && ent_ino == BADFSINO) {
-			dep->name[0] = '/';
-			bp->dirty = 1;
+		if (!no_modify && dep->name[0] == '/') {
+			*dirty = 1;
 			junkit = 0;
 		}
+
 		/*
 		 * Special .. entry processing.
 		 */
@@ -1576,7 +1464,7 @@ _("bad .. entry in root directory inode %" PRIu64 ", was %" PRIu64 ": "),
 					if (!no_modify) {
 						do_warn(_("correcting\n"));
 						dep->inumber = cpu_to_be64(ino);
-						bp->dirty = 1;
+						*dirty = 1;
 					} else {
 						do_warn(_("would correct\n"));
 					}
@@ -1608,7 +1496,7 @@ _("bad . entry in directory inode %" PRIu64 ", was %" PRIu64 ": "),
 					if (!no_modify) {
 						do_warn(_("correcting\n"));
 						dep->inumber = cpu_to_be64(ino);
-						bp->dirty = 1;
+						*dirty = 1;
 					} else {
 						do_warn(_("would correct\n"));
 					}
@@ -1635,7 +1523,7 @@ _("entry \"%*.*s\" in directory inode %" PRIu64 " points to self: "),
 		if (junkit) {
 			if (!no_modify) {
 				dep->name[0] = '/';
-				bp->dirty = 1;
+				*dirty = 1;
 				do_warn(_("clearing entry\n"));
 			} else {
 				do_warn(_("would clear entry\n"));
@@ -1644,7 +1532,7 @@ _("entry \"%*.*s\" in directory inode %" PRIu64 " points to self: "),
 		/*
 		 * Advance to the next entry.
 		 */
-		ptr += xfs_dir2_data_entsize(dep->namelen);
+		ptr += xfs_dir3_data_entsize(mp, dep->namelen);
 	}
 	/*
 	 * Check the bestfree table.
@@ -1656,7 +1544,7 @@ _("bad bestfree table in block %u in directory inode %" PRIu64 ": "),
 		if (!no_modify) {
 			do_warn(_("repairing table\n"));
 			libxfs_dir2_data_freescan(mp, d, &i);
-			bp->dirty = 1;
+			*dirty = 1;
 		} else {
 			do_warn(_("would repair table\n"));
 		}
@@ -1682,14 +1570,15 @@ process_block_dir2(
 	int		*dotdot,	/* out - 1 if there's a dotdot, else 0 */
 	int		*repair)	/* out - 1 if something was fixed */
 {
-	xfs_dir2_block_t	*block;
+	struct xfs_dir2_data_hdr *block;
 	xfs_dir2_leaf_entry_t	*blp;
 	bmap_ext_t		*bmp;
-	xfs_dabuf_t		*bp;
+	struct xfs_buf		*bp;
 	xfs_dir2_block_tail_t	*btp;
 	int			nex;
 	int			rval;
 	bmap_ext_t		lbmp;
+	int			dirty = 0;
 
 	*repair = *dot = *dotdot = 0;
 	*parent = NULLFSINO;
@@ -1700,7 +1589,7 @@ _("block %u for directory inode %" PRIu64 " is missing\n"),
 			mp->m_dirdatablk, ino);
 		return 1;
 	}
-	bp = da_read_buf(mp, nex, bmp);
+	bp = da_read_buf(mp, nex, bmp, &xfs_dir3_block_buf_ops);
 	if (bmp != &lbmp)
 		free(bmp);
 	if (bp == NULL) {
@@ -1712,11 +1601,12 @@ _("can't read block %u for directory inode %" PRIu64 "\n"),
 	/*
 	 * Verify the block
 	 */
-	block = bp->data;
-	if (be32_to_cpu(block->hdr.magic) != XFS_DIR2_BLOCK_MAGIC)
+	block = bp->b_addr;
+	if (!(be32_to_cpu(block->magic) == XFS_DIR2_BLOCK_MAGIC ||
+	      be32_to_cpu(block->magic) == XFS_DIR3_BLOCK_MAGIC))
 		do_warn(
 _("bad directory block magic # %#x in block %u for directory inode %" PRIu64 "\n"),
-			be32_to_cpu(block->hdr.magic), mp->m_dirdatablk, ino);
+			be32_to_cpu(block->magic), mp->m_dirdatablk, ino);
 	/*
 	 * process the data area
 	 * this also checks & fixes the bestfree
@@ -1729,12 +1619,15 @@ _("bad directory block magic # %#x in block %u for directory inode %" PRIu64 "\n
 	if ((char *)blp > (char *)btp)
 		blp = (xfs_dir2_leaf_entry_t *)btp;
 	rval = process_dir2_data(mp, ino, dip, ino_discovery, dirname, parent,
-		bp, dot, dotdot, mp->m_dirdatablk, (char *)blp);
-	if (bp->dirty && !no_modify) {
+		bp, dot, dotdot, mp->m_dirdatablk, (char *)blp, &dirty);
+	/* If block looks ok but CRC didn't match, make sure to recompute it. */
+	if (!rval && bp->b_error == EFSBADCRC)
+		dirty = 1;
+	if (dirty && !no_modify) {
 		*repair = 1;
-		da_bwrite(mp, bp);
+		libxfs_writebuf(bp, 0);
 	} else
-		da_brelse(bp);
+		libxfs_putbuf(bp);
 	return rval;
 }
 
@@ -1755,26 +1648,30 @@ process_leaf_block_dir2(
 {
 	int			i;
 	int			stale;
+	struct xfs_dir2_leaf_entry *ents;
+	struct xfs_dir3_icleaf_hdr leafhdr;
 
-	for (i = stale = 0; i < be16_to_cpu(leaf->hdr.count); i++) {
-		if ((char *)&leaf->ents[i] >= (char *)leaf + mp->m_dirblksize) {
+	xfs_dir3_leaf_hdr_from_disk(&leafhdr, leaf);
+	ents = xfs_dir3_leaf_ents_p(leaf);
+
+	for (i = stale = 0; i < leafhdr.count; i++) {
+		if ((char *)&ents[i] >= (char *)leaf + mp->m_dirblksize) {
 			do_warn(
 _("bad entry count in block %u of directory inode %" PRIu64 "\n"),
 				da_bno, ino);
 			return 1;
 		}
-		if (be32_to_cpu(leaf->ents[i].address) == XFS_DIR2_NULL_DATAPTR)
+		if (be32_to_cpu(ents[i].address) == XFS_DIR2_NULL_DATAPTR)
 			stale++;
-		else if (be32_to_cpu(leaf->ents[i].hashval) < last_hashval) {
+		else if (be32_to_cpu(ents[i].hashval) < last_hashval) {
 			do_warn(
 _("bad hash ordering in block %u of directory inode %" PRIu64 "\n"),
 				da_bno, ino);
 			return 1;
 		}
-		*next_hashval = last_hashval =
-					be32_to_cpu(leaf->ents[i].hashval);
+		*next_hashval = last_hashval = be32_to_cpu(ents[i].hashval);
 	}
-	if (stale != be16_to_cpu(leaf->hdr.stale)) {
+	if (stale != leafhdr.stale) {
 		do_warn(
 _("bad stale count in block %u of directory inode %" PRIu64 "\n"),
 			da_bno, ino);
@@ -1793,7 +1690,7 @@ process_leaf_level_dir2(
 	int			*repair)
 {
 	bmap_ext_t		*bmp;
-	xfs_dabuf_t		*bp;
+	struct xfs_buf		*bp;
 	int			buf_dirty;
 	xfs_dahash_t		current_hashval;
 	xfs_dablk_t		da_bno;
@@ -1803,6 +1700,7 @@ process_leaf_level_dir2(
 	int			nex;
 	xfs_dablk_t		prev_bno;
 	bmap_ext_t		lbmp;
+	struct xfs_dir3_icleaf_hdr leafhdr;
 
 	da_bno = da_cursor->level[0].bno;
 	ino = da_cursor->ino;
@@ -1828,7 +1726,7 @@ _("can't map block %u for directory inode %" PRIu64 "\n"),
 				da_bno, ino);
 			goto error_out;
 		}
-		bp = da_read_buf(mp, nex, bmp);
+		bp = da_read_buf(mp, nex, bmp, &xfs_dir3_leafn_buf_ops);
 		if (bmp != &lbmp)
 			free(bmp);
 		bmp = NULL;
@@ -1838,17 +1736,17 @@ _("can't read file block %u for directory inode %" PRIu64 "\n"),
 				da_bno, ino);
 			goto error_out;
 		}
-		leaf = bp->data;
+		leaf = bp->b_addr;
+		xfs_dir3_leaf_hdr_from_disk(&leafhdr, leaf);
 		/*
 		 * Check magic number for leaf directory btree block.
 		 */
-		if (be16_to_cpu(leaf->hdr.info.magic) !=
-		   XFS_DIR2_LEAFN_MAGIC) {
+		if (!(leafhdr.magic == XFS_DIR2_LEAFN_MAGIC ||
+		      leafhdr.magic == XFS_DIR3_LEAFN_MAGIC)) {
 			do_warn(
 _("bad directory leaf magic # %#x for directory inode %" PRIu64 " block %u\n"),
-				be16_to_cpu(leaf->hdr.info.magic),
-				ino, da_bno);
-			da_brelse(bp);
+				leafhdr.magic, ino, da_bno);
+			libxfs_putbuf(bp);
 			goto error_out;
 		}
 		buf_dirty = 0;
@@ -1858,7 +1756,7 @@ _("bad directory leaf magic # %#x for directory inode %" PRIu64 " block %u\n"),
 		 */
 		if (process_leaf_block_dir2(mp, leaf, da_bno, ino,
 				current_hashval, &greatest_hashval)) {
-			da_brelse(bp);
+			libxfs_putbuf(bp);
 			goto error_out;
 		}
 		/*
@@ -1869,32 +1767,37 @@ _("bad directory leaf magic # %#x for directory inode %" PRIu64 " block %u\n"),
 		da_cursor->level[0].hashval = greatest_hashval;
 		da_cursor->level[0].bp = bp;
 		da_cursor->level[0].bno = da_bno;
-		da_cursor->level[0].index =
-			be16_to_cpu(leaf->hdr.count);
+		da_cursor->level[0].index = leafhdr.count;
 		da_cursor->level[0].dirty = buf_dirty;
 
-		if (be32_to_cpu(leaf->hdr.info.back) != prev_bno) {
+		if (leafhdr.back != prev_bno) {
 			do_warn(
 _("bad sibling back pointer for block %u in directory inode %" PRIu64 "\n"),
 				da_bno, ino);
-			da_brelse(bp);
+			libxfs_putbuf(bp);
 			goto error_out;
 		}
 		prev_bno = da_bno;
-		da_bno = be32_to_cpu(leaf->hdr.info.forw);
+		da_bno = leafhdr.forw;
 		if (da_bno != 0) {
 			if (verify_dir2_path(mp, da_cursor, 0)) {
-				da_brelse(bp);
+				libxfs_putbuf(bp);
 				goto error_out;
 			}
 		}
 		current_hashval = greatest_hashval;
+		/*
+		 * If block looks ok but CRC didn't match, make sure to
+		 * recompute it.
+		 */
+		if (!no_modify && bp->b_error == EFSBADCRC)
+			buf_dirty = 1;
 		ASSERT(buf_dirty == 0 || (buf_dirty && !no_modify));
 		if (buf_dirty && !no_modify) {
 			*repair = 1;
-			da_bwrite(mp, bp);
+			libxfs_writebuf(bp, 0);
 		} else
-			da_brelse(bp);
+			libxfs_putbuf(bp);
 	} while (da_bno != 0);
 	if (verify_final_dir2_path(mp, da_cursor, 0)) {
 		/*
@@ -1987,8 +1890,8 @@ process_leaf_node_dir2(
 	int		isnode)		/* node directory not leaf */
 {
 	bmap_ext_t		*bmp;
-	xfs_dabuf_t		*bp;
-	xfs_dir2_data_t		*data;
+	struct xfs_buf		*bp;
+	struct xfs_dir2_data_hdr *data;
 	xfs_dfiloff_t		dbno;
 	int			good;
 	int			i;
@@ -1996,20 +1899,25 @@ process_leaf_node_dir2(
 	int			nex;
 	int			t;
 	bmap_ext_t		lbmp;
+	int			dirty = 0;
 
 	*repair = *dot = *dotdot = good = 0;
 	*parent = NULLFSINO;
 	ndbno = NULLDFILOFF;
 	while ((dbno = blkmap_next_off(blkmap, ndbno, &t)) < mp->m_dirleafblk) {
 		nex = blkmap_getn(blkmap, dbno, mp->m_dirblkfsbs, &bmp, &lbmp);
-		ndbno = dbno + mp->m_dirblkfsbs - 1;
+		/* Advance through map to last dfs block in this dir block */
+		ndbno = dbno;
+		while (ndbno < dbno + mp->m_dirblkfsbs - 1) {
+			ndbno = blkmap_next_off(blkmap, ndbno, &t);
+		}
 		if (nex == 0) {
 			do_warn(
 _("block %" PRIu64 " for directory inode %" PRIu64 " is missing\n"),
 				dbno, ino);
 			continue;
 		}
-		bp = da_read_buf(mp, nex, bmp);
+		bp = da_read_buf(mp, nex, bmp, &xfs_dir3_data_buf_ops);
 		if (bmp != &lbmp)
 			free(bmp);
 		if (bp == NULL) {
@@ -2018,21 +1926,26 @@ _("can't read block %" PRIu64 " for directory inode %" PRIu64 "\n"),
 				dbno, ino);
 			continue;
 		}
-		data = bp->data;
-		if (be32_to_cpu(data->hdr.magic) != XFS_DIR2_DATA_MAGIC)
+		data = bp->b_addr;
+		if (!(be32_to_cpu(data->magic) == XFS_DIR2_DATA_MAGIC ||
+		      be32_to_cpu(data->magic) == XFS_DIR3_DATA_MAGIC))
 			do_warn(
 _("bad directory block magic # %#x in block %" PRIu64 " for directory inode %" PRIu64 "\n"),
-				be32_to_cpu(data->hdr.magic), dbno, ino);
+				be32_to_cpu(data->magic), dbno, ino);
 		i = process_dir2_data(mp, ino, dip, ino_discovery, dirname,
 			parent, bp, dot, dotdot, (xfs_dablk_t)dbno,
-			(char *)data + mp->m_dirblksize);
-		if (i == 0)
+			(char *)data + mp->m_dirblksize, &dirty);
+		if (i == 0) {
 			good++;
-		if (bp->dirty && !no_modify) {
+			/* Maybe just CRC is wrong. Make sure we correct it. */
+			if (bp->b_error == EFSBADCRC)
+				dirty = 1;
+		}
+		if (dirty && !no_modify) {
 			*repair = 1;
-			da_bwrite(mp, bp);
+			libxfs_writebuf(bp, 0);
 		} else
-			da_brelse(bp);
+			libxfs_putbuf(bp);
 	}
 	if (good == 0)
 		return 1;

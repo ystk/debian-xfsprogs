@@ -24,7 +24,7 @@ struct field;
 typedef enum typnm
 {
 	TYP_AGF, TYP_AGFL, TYP_AGI, TYP_ATTR, TYP_BMAPBTA,
-	TYP_BMAPBTD, TYP_BNOBT, TYP_CNTBT, TYP_DATA, TYP_DIR,
+	TYP_BMAPBTD, TYP_BNOBT, TYP_CNTBT, TYP_DATA,
 	TYP_DIR2, TYP_DQBLK, TYP_INOBT, TYP_INODATA, TYP_INODE,
 	TYP_LOG, TYP_RTBITMAP, TYP_RTSUMMARY, TYP_SB, TYP_SYMLINK,
 	TYP_TEXT, TYP_NONE
@@ -42,10 +42,12 @@ typedef struct typ
 	char			*name;
 	pfunc_t			pfunc;
 	const struct field	*fields;
+	const struct xfs_buf_ops *bops;
 } typ_t;
-extern const typ_t	typtab[], *cur_typ;
+extern const typ_t	*typtab, *cur_typ;
 
 extern void	type_init(void);
+extern void	type_set_tab_crc(void);
 extern void	handle_block(int action, const struct field *fields, int argc,
 			     char **argv);
 extern void	handle_string(int action, const struct field *fields, int argc,

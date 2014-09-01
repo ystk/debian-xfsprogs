@@ -18,6 +18,25 @@
 #ifndef __CACHE_H__
 #define __CACHE_H__
 
+/*
+ * initialisation flags
+ */
+/*
+ * xfs_db always writes changes immediately, and so we need to purge buffers
+ * when we get a buffer lookup mismatch due to reading the same block with a
+ * different buffer configuration.
+ */
+#define CACHE_MISCOMPARE_PURGE	(1 << 0)
+
+/*
+ * cache object campare return values
+ */
+enum {
+	CACHE_HIT,
+	CACHE_MISS,
+	CACHE_PURGE,
+};
+
 #define	HASH_CACHE_RATIO	8
 
 /*
@@ -47,7 +66,8 @@ typedef void (*cache_walk_t)(struct cache_node *);
 typedef struct cache_node * (*cache_node_alloc_t)(cache_key_t);
 typedef void (*cache_node_flush_t)(struct cache_node *);
 typedef void (*cache_node_relse_t)(struct cache_node *);
-typedef unsigned int (*cache_node_hash_t)(cache_key_t, unsigned int);
+typedef unsigned int (*cache_node_hash_t)(cache_key_t, unsigned int,
+					  unsigned int);
 typedef int (*cache_node_compare_t)(struct cache_node *, cache_key_t);
 typedef unsigned int (*cache_bulk_relse_t)(struct cache *, struct list_head *);
 
@@ -82,6 +102,7 @@ struct cache_node {
 };
 
 struct cache {
+	int			c_flags;	/* behavioural flags */
 	unsigned int		c_maxcount;	/* max cache nodes */
 	unsigned int		c_count;	/* count of nodes */
 	pthread_mutex_t		c_mutex;	/* node count mutex */
@@ -92,6 +113,7 @@ struct cache {
 	cache_node_compare_t	compare;	/* comparison routine */
 	cache_bulk_relse_t	bulkrelse;	/* bulk release routine */
 	unsigned int		c_hashsize;	/* hash bucket count */
+	unsigned int		c_hashshift;	/* hash key shift */
 	struct cache_hash	*c_hash;	/* hash table buckets */
 	struct cache_mru	c_mrus[CACHE_MAX_PRIORITY + 1];
 	unsigned long long	c_misses;	/* cache misses */
@@ -99,7 +121,7 @@ struct cache {
 	unsigned int 		c_max;		/* max nodes ever used */
 };
 
-struct cache *cache_init(unsigned int, struct cache_operations *);
+struct cache *cache_init(int, unsigned int, struct cache_operations *);
 void cache_destroy(struct cache *);
 void cache_walk(struct cache *, cache_walk_t);
 void cache_purge(struct cache *);

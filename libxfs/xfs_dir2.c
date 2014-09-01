@@ -18,7 +18,24 @@
 
 #include <xfs.h>
 
-struct xfs_name xfs_name_dotdot = { (unsigned char *)"..", 2};
+struct xfs_name xfs_name_dotdot = { (unsigned char *)"..", 2, XFS_DIR3_FT_DIR };
+
+/*
+ * @mode, if set, indicates that the type field needs to be set up.
+ * This uses the transformation from file mode to DT_* as defined in linux/fs.h
+ * for file type specification. This will be propagated into the directory
+ * structure if appropriate for the given operation and filesystem config.
+ */
+const unsigned char xfs_mode_to_ftype[S_IFMT >> S_SHIFT] = {
+	[0]			= XFS_DIR3_FT_UNKNOWN,
+	[S_IFREG >> S_SHIFT]	= XFS_DIR3_FT_REG_FILE,
+	[S_IFDIR >> S_SHIFT]	= XFS_DIR3_FT_DIR,
+	[S_IFCHR >> S_SHIFT]	= XFS_DIR3_FT_CHRDEV,
+	[S_IFBLK >> S_SHIFT]	= XFS_DIR3_FT_BLKDEV,
+	[S_IFIFO >> S_SHIFT]	= XFS_DIR3_FT_FIFO,
+	[S_IFSOCK >> S_SHIFT]	= XFS_DIR3_FT_SOCK,
+	[S_IFLNK >> S_SHIFT]	= XFS_DIR3_FT_SYMLINK,
+};
 
 /*
  * ASCII case-insensitive (ie. A-Z) support for directories that was
@@ -70,6 +87,9 @@ void
 xfs_dir_mount(
 	xfs_mount_t	*mp)
 {
+	int	nodehdr_size;
+
+
 	ASSERT(xfs_sb_version_hasdirv2(&mp->m_sb));
 	ASSERT((1 << (mp->m_sb.sb_blocklog + mp->m_sb.sb_dirblklog)) <=
 	       XFS_MAX_BLOCKSIZE);
@@ -78,12 +98,13 @@ xfs_dir_mount(
 	mp->m_dirdatablk = xfs_dir2_db_to_da(mp, XFS_DIR2_DATA_FIRSTDB(mp));
 	mp->m_dirleafblk = xfs_dir2_db_to_da(mp, XFS_DIR2_LEAF_FIRSTDB(mp));
 	mp->m_dirfreeblk = xfs_dir2_db_to_da(mp, XFS_DIR2_FREE_FIRSTDB(mp));
-	mp->m_attr_node_ents =
-		(mp->m_sb.sb_blocksize - (uint)sizeof(xfs_da_node_hdr_t)) /
-		(uint)sizeof(xfs_da_node_entry_t);
-	mp->m_dir_node_ents =
-		(mp->m_dirblksize - (uint)sizeof(xfs_da_node_hdr_t)) /
-		(uint)sizeof(xfs_da_node_entry_t);
+
+	nodehdr_size = __xfs_da3_node_hdr_size(xfs_sb_version_hascrc(&mp->m_sb));
+	mp->m_attr_node_ents = (mp->m_sb.sb_blocksize - nodehdr_size) /
+				(uint)sizeof(xfs_da_node_entry_t);
+	mp->m_dir_node_ents = (mp->m_dirblksize - nodehdr_size) /
+				(uint)sizeof(xfs_da_node_entry_t);
+
 	mp->m_dir_magicpct = (mp->m_dirblksize * 37) / 100;
 	if (xfs_sb_version_hasasciici(&mp->m_sb))
 		mp->m_dirnameops = &xfs_ascii_ci_nameops;
@@ -98,15 +119,15 @@ int
 xfs_dir_isempty(
 	xfs_inode_t	*dp)
 {
-	xfs_dir2_sf_t	*sfp;
+	xfs_dir2_sf_hdr_t	*sfp;
 
-	ASSERT((dp->i_d.di_mode & S_IFMT) == S_IFDIR);
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
 	if (dp->i_d.di_size == 0)	/* might happen during shutdown. */
 		return 1;
 	if (dp->i_d.di_size > XFS_IFORK_DSIZE(dp))
 		return 0;
-	sfp = (xfs_dir2_sf_t *)dp->i_df.if_u1.if_data;
-	return !sfp->hdr.count;
+	sfp = (xfs_dir2_sf_hdr_t *)dp->i_df.if_u1.if_data;
+	return !sfp->count;
 }
 
 /*
@@ -135,7 +156,7 @@ xfs_dir_ino_validate(
 		XFS_AGINO_TO_INO(mp, agno, agino) == ino;
 	if (unlikely(XFS_TEST_ERROR(!ino_ok, mp, XFS_ERRTAG_DIR_INO_VALIDATE,
 			XFS_RANDOM_DIR_INO_VALIDATE))) {
-		xfs_fs_cmn_err(CE_WARN, mp, "Invalid inode number 0x%Lx",
+		xfs_warn(mp, "Invalid inode number 0x%Lx",
 				(unsigned long long) ino);
 		XFS_ERROR_REPORT("xfs_dir_ino_validate", XFS_ERRLEVEL_LOW, mp);
 		return XFS_ERROR(EFSCORRUPTED);
@@ -158,7 +179,7 @@ xfs_dir_init(
 	memset((char *)&args, 0, sizeof(args));
 	args.dp = dp;
 	args.trans = tp;
-	ASSERT((dp->i_d.di_mode & S_IFMT) == S_IFDIR);
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
 	if ((error = xfs_dir_ino_validate(tp->t_mountp, pdp->i_ino)))
 		return error;
 	return xfs_dir2_sf_create(&args, pdp->i_ino);
@@ -181,7 +202,7 @@ xfs_dir_createname(
 	int			rval;
 	int			v;		/* type-checking value */
 
-	ASSERT((dp->i_d.di_mode & S_IFMT) == S_IFDIR);
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
 	if ((rval = xfs_dir_ino_validate(tp->t_mountp, inum)))
 		return rval;
 	XFS_STATS_INC(xs_dir_create);
@@ -189,6 +210,7 @@ xfs_dir_createname(
 	memset(&args, 0, sizeof(xfs_da_args_t));
 	args.name = name->name;
 	args.namelen = name->len;
+	args.filetype = name->type;
 	args.hashval = dp->i_mount->m_dirnameops->hashname(name);
 	args.inumber = inum;
 	args.dp = dp;
@@ -257,12 +279,13 @@ xfs_dir_lookup(
 	int		rval;
 	int		v;		/* type-checking value */
 
-	ASSERT((dp->i_d.di_mode & S_IFMT) == S_IFDIR);
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
 	XFS_STATS_INC(xs_dir_lookup);
 
 	memset(&args, 0, sizeof(xfs_da_args_t));
 	args.name = name->name;
 	args.namelen = name->len;
+	args.filetype = name->type;
 	args.hashval = dp->i_mount->m_dirnameops->hashname(name);
 	args.dp = dp;
 	args.whichfork = XFS_DATA_FORK;
@@ -312,12 +335,13 @@ xfs_dir_removename(
 	int		rval;
 	int		v;		/* type-checking value */
 
-	ASSERT((dp->i_d.di_mode & S_IFMT) == S_IFDIR);
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
 	XFS_STATS_INC(xs_dir_remove);
 
 	memset(&args, 0, sizeof(xfs_da_args_t));
 	args.name = name->name;
 	args.namelen = name->len;
+	args.filetype = name->type;
 	args.hashval = dp->i_mount->m_dirnameops->hashname(name);
 	args.inumber = ino;
 	args.dp = dp;
@@ -359,7 +383,7 @@ xfs_dir_replace(
 	int		rval;
 	int		v;		/* type-checking value */
 
-	ASSERT((dp->i_d.di_mode & S_IFMT) == S_IFDIR);
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
 
 	if ((rval = xfs_dir_ino_validate(tp->t_mountp, inum)))
 		return rval;
@@ -367,6 +391,7 @@ xfs_dir_replace(
 	memset(&args, 0, sizeof(xfs_da_args_t));
 	args.name = name->name;
 	args.namelen = name->len;
+	args.filetype = name->type;
 	args.hashval = dp->i_mount->m_dirnameops->hashname(name);
 	args.inumber = inum;
 	args.dp = dp;
@@ -392,134 +417,85 @@ xfs_dir_replace(
 }
 
 /*
+ * See if this entry can be added to the directory without allocating space.
+ * First checks that the caller couldn't reserve enough space (resblks = 0).
+ */
+int
+xfs_dir_canenter(
+	xfs_trans_t	*tp,
+	xfs_inode_t	*dp,
+	struct xfs_name	*name,		/* name of entry to add */
+	uint		resblks)
+{
+	xfs_da_args_t	args;
+	int		rval;
+	int		v;		/* type-checking value */
+
+	if (resblks)
+		return 0;
+
+	ASSERT(S_ISDIR(dp->i_d.di_mode));
+
+	memset(&args, 0, sizeof(xfs_da_args_t));
+	args.name = name->name;
+	args.namelen = name->len;
+	args.filetype = name->type;
+	args.hashval = dp->i_mount->m_dirnameops->hashname(name);
+	args.dp = dp;
+	args.whichfork = XFS_DATA_FORK;
+	args.trans = tp;
+	args.op_flags = XFS_DA_OP_JUSTCHECK | XFS_DA_OP_ADDNAME |
+							XFS_DA_OP_OKNOENT;
+
+	if (dp->i_d.di_format == XFS_DINODE_FMT_LOCAL)
+		rval = xfs_dir2_sf_addname(&args);
+	else if ((rval = xfs_dir2_isblock(tp, dp, &v)))
+		return rval;
+	else if (v)
+		rval = xfs_dir2_block_addname(&args);
+	else if ((rval = xfs_dir2_isleaf(tp, dp, &v)))
+		return rval;
+	else if (v)
+		rval = xfs_dir2_leaf_addname(&args);
+	else
+		rval = xfs_dir2_node_addname(&args);
+	return rval;
+}
+
+/*
  * Utility routines.
  */
 
 /*
  * Add a block to the directory.
- * This routine is for data and free blocks, not leaf/node blocks
- * which are handled by xfs_da_grow_inode.
+ *
+ * This routine is for data and free blocks, not leaf/node blocks which are
+ * handled by xfs_da_grow_inode.
  */
 int
 xfs_dir2_grow_inode(
-	xfs_da_args_t	*args,
-	int		space,		/* v2 dir's space XFS_DIR2_xxx_SPACE */
-	xfs_dir2_db_t	*dbp)		/* out: block number added */
+	struct xfs_da_args	*args,
+	int			space,	/* v2 dir's space XFS_DIR2_xxx_SPACE */
+	xfs_dir2_db_t		*dbp)	/* out: block number added */
 {
-	xfs_fileoff_t	bno;		/* directory offset of new block */
-	int		count;		/* count of filesystem blocks */
-	xfs_inode_t	*dp;		/* incore directory inode */
-	int		error;
-	int		got;		/* blocks actually mapped */
-	int		i;
-	xfs_bmbt_irec_t	map;		/* single structure for bmap */
-	int		mapi;		/* mapping index */
-	xfs_bmbt_irec_t	*mapp;		/* bmap mapping structure(s) */
-	xfs_mount_t	*mp;
-	int		nmap;		/* number of bmap entries */
-	xfs_trans_t	*tp;
-	xfs_drfsbno_t	nblks;
+	struct xfs_inode	*dp = args->dp;
+	struct xfs_mount	*mp = dp->i_mount;
+	xfs_fileoff_t		bno;	/* directory offset of new block */
+	int			count;	/* count of filesystem blocks */
+	int			error;
 
 	trace_xfs_dir2_grow_inode(args, space);
 
-	dp = args->dp;
-	tp = args->trans;
-	mp = dp->i_mount;
-	nblks = dp->i_d.di_nblocks;
 	/*
 	 * Set lowest possible block in the space requested.
 	 */
 	bno = XFS_B_TO_FSBT(mp, space * XFS_DIR2_SPACE_SIZE);
 	count = mp->m_dirblkfsbs;
-	/*
-	 * Find the first hole for our block.
-	 */
-	if ((error = xfs_bmap_first_unused(tp, dp, count, &bno, XFS_DATA_FORK)))
+
+	error = xfs_da_grow_inode_int(args, &bno, count);
+	if (error)
 		return error;
-	nmap = 1;
-	ASSERT(args->firstblock != NULL);
-	/*
-	 * Try mapping the new block contiguously (one extent).
-	 */
-	if ((error = xfs_bmapi(tp, dp, bno, count,
-			XFS_BMAPI_WRITE|XFS_BMAPI_METADATA|XFS_BMAPI_CONTIG,
-			args->firstblock, args->total, &map, &nmap,
-			args->flist)))
-		return error;
-	ASSERT(nmap <= 1);
-	if (nmap == 1) {
-		mapp = &map;
-		mapi = 1;
-	}
-	/*
-	 * Didn't work and this is a multiple-fsb directory block.
-	 * Try again with contiguous flag turned on.
-	 */
-	else if (nmap == 0 && count > 1) {
-		xfs_fileoff_t	b;	/* current file offset */
 
-		/*
-		 * Space for maximum number of mappings.
-		 */
-		mapp = kmem_alloc(sizeof(*mapp) * count, KM_SLEEP);
-		/*
-		 * Iterate until we get to the end of our block.
-		 */
-		for (b = bno, mapi = 0; b < bno + count; ) {
-			int	c;	/* current fsb count */
-
-			/*
-			 * Can't map more than MAX_NMAP at once.
-			 */
-			nmap = MIN(XFS_BMAP_MAX_NMAP, count);
-			c = (int)(bno + count - b);
-			if ((error = xfs_bmapi(tp, dp, b, c,
-					XFS_BMAPI_WRITE|XFS_BMAPI_METADATA,
-					args->firstblock, args->total,
-					&mapp[mapi], &nmap, args->flist))) {
-				kmem_free(mapp);
-				return error;
-			}
-			if (nmap < 1)
-				break;
-			/*
-			 * Add this bunch into our table, go to the next offset.
-			 */
-			mapi += nmap;
-			b = mapp[mapi - 1].br_startoff +
-			    mapp[mapi - 1].br_blockcount;
-		}
-	}
-	/*
-	 * Didn't work.
-	 */
-	else {
-		mapi = 0;
-		mapp = NULL;
-	}
-	/*
-	 * See how many fsb's we got.
-	 */
-	for (i = 0, got = 0; i < mapi; i++)
-		got += mapp[i].br_blockcount;
-	/*
-	 * Didn't get enough fsb's, or the first/last block's are wrong.
-	 */
-	if (got != count || mapp[0].br_startoff != bno ||
-	    mapp[mapi - 1].br_startoff + mapp[mapi - 1].br_blockcount !=
-	    bno + count) {
-		if (mapp != &map)
-			kmem_free(mapp);
-		return XFS_ERROR(ENOSPC);
-	}
-	/*
-	 * Done with the temporary mapping table.
-	 */
-	if (mapp != &map)
-		kmem_free(mapp);
-
-	/* account for newly allocated blocks in reserved blocks total */
-	args->total -= dp->i_d.di_nblocks - nblks;
 	*dbp = xfs_dir2_da_to_db(mp, (xfs_dablk_t)bno);
 
 	/*
@@ -531,7 +507,7 @@ xfs_dir2_grow_inode(
 		size = XFS_FSB_TO_B(mp, bno + count);
 		if (size > dp->i_d.di_size) {
 			dp->i_d.di_size = size;
-			xfs_trans_log_inode(tp, dp, XFS_ILOG_CORE);
+			xfs_trans_log_inode(args->trans, dp, XFS_ILOG_CORE);
 		}
 	}
 	return 0;
@@ -588,7 +564,7 @@ int
 xfs_dir2_shrink_inode(
 	xfs_da_args_t	*args,
 	xfs_dir2_db_t	db,
-	xfs_dabuf_t	*bp)
+	struct xfs_buf	*bp)
 {
 	xfs_fileoff_t	bno;		/* directory file offset */
 	xfs_dablk_t	da;		/* directory file offset */
@@ -630,7 +606,7 @@ xfs_dir2_shrink_inode(
 	/*
 	 * Invalidate the buffer from the transaction.
 	 */
-	xfs_da_binval(tp, bp);
+	xfs_trans_binval(tp, bp);
 	/*
 	 * If it's not a data block, we're done.
 	 */

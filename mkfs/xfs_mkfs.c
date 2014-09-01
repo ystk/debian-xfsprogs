@@ -33,7 +33,8 @@ struct fs_topology {
 	int	dsunit;		/* stripe unit - data subvolume */
 	int	dswidth;	/* stripe width - data subvolume */
 	int	rtswidth;	/* stripe width - rt subvolume */
-	int	sectorsize;
+	int	lsectorsize;	/* logical sector size &*/
+	int	psectorsize;	/* physical sector size */
 	int	sectoralign;
 };
 
@@ -146,6 +147,8 @@ char	*nopts[] = {
 	"size",
 #define	N_VERSION	2
 	"version",
+#define	N_FTYPE		3
+	"ftype",
 	NULL,
 };
 
@@ -174,6 +177,14 @@ char	*sopts[] = {
 	"size",
 #define	S_SECTSIZE	3
 	"sectsize",
+	NULL
+};
+
+char	*mopts[] = {
+#define	M_CRC		0
+	"crc",
+#define M_FINOBT	1
+	"finobt",
 	NULL
 };
 
@@ -369,8 +380,15 @@ out:
 	return ret;
 }
 
-static void blkid_get_topology(const char *device, int *sunit, int *swidth, int *sectorsize)
+static void blkid_get_topology(
+	const char	*device,
+	int		*sunit,
+	int		*swidth,
+	int		*lsectorsize,
+	int		*psectorsize,
+	int		force_overwrite)
 {
+
 	blkid_topology tp;
 	blkid_probe pr;
 	unsigned long val;
@@ -388,27 +406,39 @@ static void blkid_get_topology(const char *device, int *sunit, int *swidth, int 
 	if (!tp)
 		goto out_free_probe;
 
+	val = blkid_topology_get_logical_sector_size(tp);
+	*lsectorsize = val;
+	val = blkid_topology_get_physical_sector_size(tp);
+	*psectorsize = val;
+
 	/*
 	 * Blkid reports the information in terms of bytes, but we want it in
 	 * terms of 512 bytes blocks (just to convert it to bytes later..)
 	 *
-	 * If the reported values are just the normal 512 byte block size
-	 * do not bother to report anything.  It will just causes warnings
-	 * if people specifier larger stripe units or widths manually.
+	 * If the reported values are the same as the physical sector size
+	 * do not bother to report anything.  It will just cause warnings
+	 * if people specify larger stripe units or widths manually.
 	 */
-	val = blkid_topology_get_minimum_io_size(tp) >> 9;
-	if (val > 1)
-		*sunit = val;
-	val = blkid_topology_get_optimal_io_size(tp) >> 9;
-	if (val > 1)
-		*swidth = val;
-	val = blkid_probe_get_sectorsize(pr);
-	*sectorsize = val;
+	val = blkid_topology_get_minimum_io_size(tp);
+	if (val > *psectorsize)
+		*sunit = val >> 9;
+	val = blkid_topology_get_optimal_io_size(tp);
+	if (val > *psectorsize)
+		*swidth = val >> 9;
 
 	if (blkid_topology_get_alignment_offset(tp) != 0) {
 		fprintf(stderr,
 			_("warning: device is not properly aligned %s\n"),
 			device);
+
+		if (!force_overwrite) {
+			fprintf(stderr,
+				_("Use -f to force usage of a misaligned device\n"));
+
+			exit(EXIT_FAILURE);
+		}
+		/* Do not use physical sector size if the device is misaligned */
+		*psectorsize = *lsectorsize;
 	}
 
 	blkid_free_probe(pr);
@@ -421,19 +451,43 @@ out_free_probe:
 		device);
 }
 
-static void get_topology(libxfs_init_t *xi, struct fs_topology *ft)
+static void get_topology(
+	libxfs_init_t		*xi,
+	struct fs_topology	*ft,
+	int			force_overwrite)
 {
 	if (!xi->disfile) {
-		const char *dfile = xi->volname ? xi->volname : xi->dname;
+		char *dfile = xi->volname ? xi->volname : xi->dname;
+		struct stat statbuf;
 
-		blkid_get_topology(dfile, &ft->dsunit, &ft->dswidth,
-				   &ft->sectorsize);
+		/*
+		 * If our target is a regular file, and xi->disfile isn't
+		 * set (i.e. no "-d file" invocation), use platform_findsizes
+		 * to try to obtain the underlying filesystem's requirements
+		 * for direct IO; we'll set our sector size to that if possible.
+		 */
+		if (!stat(dfile, &statbuf) && S_ISREG(statbuf.st_mode)) {
+			int fd;
+			long long dummy;
+
+			fd = open(dfile, O_RDONLY);
+			if (fd >= 0) {
+				platform_findsizes(dfile, fd, &dummy,
+						   &ft->lsectorsize);
+				close(fd);
+			}
+		} else {
+			blkid_get_topology(dfile, &ft->dsunit, &ft->dswidth,
+					   &ft->lsectorsize, &ft->psectorsize,
+					   force_overwrite);
+		}
 	}
 
 	if (xi->rtname && !xi->risfile) {
 		int dummy;
 
-		blkid_get_topology(xi->rtname, &dummy, &ft->rtswidth, &dummy);
+		blkid_get_topology(xi->rtname, &dummy, &ft->rtswidth,
+				   &dummy, &dummy, force_overwrite);
 	}
 }
 #else /* ENABLE_BLKID */
@@ -460,8 +514,12 @@ check_overwrite(
 	return 0;
 }
 
-static void get_topology(libxfs_init_t *xi, struct fs_topology *ft)
+static void get_topology(
+	libxfs_init_t		*xi,
+	struct fs_topology	*ft,
+	int			force_overwrite)
 {
+
 	char *dfile = xi->volname ? xi->volname : xi->dname;
 	int bsz = BBSIZE;
 
@@ -479,7 +537,8 @@ static void get_topology(libxfs_init_t *xi, struct fs_topology *ft)
 		}
 	}
 
-	ft->sectorsize = bsz;
+	ft->lsectorsize = bsz;
+	ft->psectorsize = bsz;
 
 	if (xi->rtname && !xi->risfile) {
 		int dummy1;
@@ -677,7 +736,7 @@ validate_ag_geometry(
 {
 	if (agsize < XFS_AG_MIN_BLOCKS(blocklog)) {
 		fprintf(stderr,
-	_("agsize (%lldb) too small, need at least %lld blocks\n"),
+	_("agsize (%lld blocks) too small, need at least %lld blocks\n"),
 			(long long)agsize,
 			(long long)XFS_AG_MIN_BLOCKS(blocklog));
 		usage();
@@ -685,7 +744,7 @@ validate_ag_geometry(
 
 	if (agsize > XFS_AG_MAX_BLOCKS(blocklog)) {
 		fprintf(stderr,
-	_("agsize (%lldb) too big, maximum is %lld blocks\n"),
+	_("agsize (%lld blocks) too big, maximum is %lld blocks\n"),
 			(long long)agsize,
 			(long long)XFS_AG_MAX_BLOCKS(blocklog));
 		usage();
@@ -693,7 +752,7 @@ validate_ag_geometry(
 
 	if (agsize > dblocks) {
 		fprintf(stderr,
-	_("agsize (%lldb) too big, data area is %lld blocks\n"),
+	_("agsize (%lld blocks) too big, data area is %lld blocks\n"),
 			(long long)agsize, (long long)dblocks);
 			usage();
 	}
@@ -834,7 +893,7 @@ main(
 	__uint64_t		agsize;
 	xfs_alloc_rec_t		*arec;
 	int			attrversion;
-	int			projid32bit;
+	int			projid16bit;
 	struct xfs_btree_block	*block;
 	int			blflag;
 	int			blocklog;
@@ -849,6 +908,7 @@ main(
 	char			*dfile;
 	int			dirblocklog;
 	int			dirblocksize;
+	int			dirftype;
 	int			dirversion;
 	char			*dsize;
 	int			dsu;
@@ -886,7 +946,6 @@ main(
 	int			lssflag;
 	int			lsu;
 	int			lsunit;
-	int			max_tr_res;
 	int			min_logblocks;
 	xfs_mount_t		*mp;
 	xfs_mount_t		mbuf;
@@ -895,6 +954,7 @@ main(
 	int			nodsflag;
 	int			norsflag;
 	xfs_alloc_rec_t		*nrec;
+	int			nftype;
 	int			nsflag;
 	int			nvflag;
 	int			nci;
@@ -922,6 +982,8 @@ main(
 	libxfs_init_t		xi;
 	struct fs_topology	ft;
 	int			lazy_sb_counters;
+	int			crcs_enabled;
+	int			finobt;
 
 	progname = basename(argv[0]);
 	setlocale(LC_ALL, "");
@@ -929,7 +991,7 @@ main(
 	textdomain(PACKAGE);
 
 	attrversion = 2;
-	projid32bit = 0;
+	projid16bit = 0;
 	blflag = bsflag = slflag = ssflag = lslflag = lssflag = 0;
 	blocklog = blocksize = 0;
 	sectorlog = lsectorlog = XFS_MIN_SECTORSIZE_LOG;
@@ -941,6 +1003,7 @@ main(
 	logversion = 2;
 	logagno = logblocks = rtblocks = rtextblocks = 0;
 	Nflag = nlflag = nsflag = nvflag = nci = 0;
+	nftype = dirftype = 0;		/* inode type information in the dir */
 	dirblocklog = dirblocksize = 0;
 	dirversion = XFS_DFL_DIR_VERSION;
 	qflag = 0;
@@ -953,13 +1016,15 @@ main(
 	force_overwrite = 0;
 	worst_freelist = 0;
 	lazy_sb_counters = 1;
+	crcs_enabled = 0;
+	finobt = 0;
 	memset(&fsx, 0, sizeof(fsx));
 
 	memset(&xi, 0, sizeof(xi));
 	xi.isdirect = LIBXFS_DIRECT;
 	xi.isreadonly = LIBXFS_EXCLUSIVELY;
 
-	while ((c = getopt(argc, argv, "b:d:i:l:L:n:KNp:qr:s:CfV")) != EOF) {
+	while ((c = getopt(argc, argv, "b:d:i:l:L:m:n:KNp:qr:s:CfV")) != EOF) {
 		switch (c) {
 		case 'C':
 		case 'f':
@@ -1272,7 +1337,7 @@ main(
 					c = atoi(value);
 					if (c < 0 || c > 1)
 						illegal(value, "i projid32bit");
-					projid32bit = c;
+					projid16bit = c ? 0 : 1;
 					break;
 				default:
 					unknown('i', value);
@@ -1425,6 +1490,38 @@ main(
 				illegal(optarg, "L");
 			label = optarg;
 			break;
+		case 'm':
+			p = optarg;
+			while (*p != '\0') {
+				char	*value;
+
+				switch (getsubopt(&p, (constpp)mopts, &value)) {
+				case M_CRC:
+					if (!value || *value == '\0')
+						reqval('m', mopts, M_CRC);
+					c = atoi(value);
+					if (c < 0 || c > 1)
+						illegal(value, "m crc");
+					crcs_enabled = c;
+					if (nftype && crcs_enabled) {
+						fprintf(stderr,
+_("cannot specify both crc and ftype\n"));
+						usage();
+					}
+					break;
+				case M_FINOBT:
+					if (!value || *value == '\0')
+						reqval('m', mopts, M_CRC);
+					c = atoi(value);
+					if (c < 0 || c > 1)
+						illegal(value, "m finobt");
+					finobt = c;
+					break;
+				default:
+					unknown('m', value);
+				}
+			}
+			break;
 		case 'n':
 			p = optarg;
 			while (*p != '\0') {
@@ -1476,6 +1573,19 @@ main(
 								"n version");
 					}
 					nvflag = 1;
+					break;
+				case N_FTYPE:
+					if (!value || *value == '\0')
+						reqval('n', nopts, N_FTYPE);
+					if (nftype)
+						respec('n', nopts, N_FTYPE);
+					dirftype = atoi(value);
+					if (crcs_enabled) {
+						fprintf(stderr,
+_("cannot specify both crc and ftype\n"));
+						usage();
+					}
+					nftype = 1;
 					break;
 				default:
 					unknown('n', value);
@@ -1625,7 +1735,7 @@ main(
 	}
 
 	memset(&ft, 0, sizeof(ft));
-	get_topology(&xi, &ft);
+	get_topology(&xi, &ft, force_overwrite);
 
 	if (ft.sectoralign) {
 		/*
@@ -1640,9 +1750,29 @@ main(
 	} else if (!ssflag) {
 		/*
 		 * Unless specified manually on the command line use the
-		 * advertised sector size of the device.
+		 * advertised sector size of the device.  We use the physical
+		 * sector size unless the requested block size is smaller
+		 * than that, then we can use logical, but warn about the
+		 * inefficiency.
 		 */
-		sectorsize = ft.sectorsize ? ft.sectorsize : XFS_MIN_SECTORSIZE;
+
+		/* Older kernels may not have physical/logical distinction */
+		if (!ft.psectorsize)
+			ft.psectorsize = ft.lsectorsize;
+
+		sectorsize = ft.psectorsize ? ft.psectorsize :
+					      XFS_MIN_SECTORSIZE;
+
+		if ((blocksize < sectorsize) && (blocksize >= ft.lsectorsize)) {
+			fprintf(stderr,
+_("specified blocksize %d is less than device physical sector size %d\n"),
+				blocksize, ft.psectorsize);
+			fprintf(stderr,
+_("switching to logical sector size %d\n"),
+				ft.lsectorsize);
+			sectorsize = ft.lsectorsize ? ft.lsectorsize :
+						      XFS_MIN_SECTORSIZE;
+		}
 	}
 
 	if (ft.sectoralign || !ssflag) {
@@ -1655,12 +1785,17 @@ main(
 
 	if (sectorsize < XFS_MIN_SECTORSIZE ||
 	    sectorsize > XFS_MAX_SECTORSIZE || sectorsize > blocksize) {
-		fprintf(stderr, _("illegal sector size %d\n"), sectorsize);
+		if (ssflag)
+			fprintf(stderr, _("illegal sector size %d\n"), sectorsize);
+		else
+			fprintf(stderr,
+_("block size %d cannot be smaller than logical sector size %d\n"),
+				blocksize, ft.lsectorsize);
 		usage();
 	}
-	if (sectorsize < ft.sectorsize) {
+	if (sectorsize < ft.lsectorsize) {
 		fprintf(stderr, _("illegal sector size %d; hw sector is %d\n"),
-			sectorsize, ft.sectorsize);
+			sectorsize, ft.lsectorsize);
 		usage();
 	}
 	if (lsectorsize < XFS_MIN_SECTORSIZE ||
@@ -1670,6 +1805,67 @@ main(
 	} else if (lsectorsize > XFS_MIN_SECTORSIZE && !lsu && !lsunit) {
 		lsu = blocksize;
 		logversion = 2;
+	}
+
+	/*
+	 * Now we have blocks and sector sizes set up, check parameters that are
+	 * no longer optional for CRC enabled filesystems.  Catch them up front
+	 * here before doing anything else.
+	 */
+	if (crcs_enabled) {
+		/* minimum inode size is 512 bytes, ipflag checked later */
+		if ((isflag || ilflag) && inodelog < XFS_DINODE_DFL_CRC_LOG) {
+			fprintf(stderr,
+_("Minimum inode size for CRCs is %d bytes\n"),
+				1 << XFS_DINODE_DFL_CRC_LOG);
+			usage();
+		}
+
+		/* inodes always aligned */
+		if (iaflag != 1) {
+			fprintf(stderr,
+_("Inodes always aligned for CRC enabled filesytems\n"));
+			usage();
+		}
+
+		/* lazy sb counters always on */
+		if (lazy_sb_counters != 1) {
+			fprintf(stderr,
+_("Lazy superblock counted always enabled for CRC enabled filesytems\n"));
+			usage();
+		}
+
+		/* version 2 logs always on */
+		if (logversion != 2) {
+			fprintf(stderr,
+_("V2 logs always enabled for CRC enabled filesytems\n"));
+			usage();
+		}
+
+		/* attr2 always on */
+		if (attrversion != 2) {
+			fprintf(stderr,
+_("V2 attribute format always enabled on CRC enabled filesytems\n"));
+			usage();
+		}
+
+		/* 32 bit project quota always on */
+		/* attr2 always on */
+		if (projid16bit == 1) {
+			fprintf(stderr,
+_("32 bit Project IDs always enabled on CRC enabled filesytems\n"));
+			usage();
+		}
+	}
+
+	/*
+	 * The kernel doesn't currently support crc=0,finobt=1 filesystems.
+	 * Catch it here, disable finobt and warn the user.
+	 */
+	if (finobt && !crcs_enabled) {
+		fprintf(stderr,
+_("warning: finobt not supported without CRC support, disabled.\n"));
+		finobt = 0;
 	}
 
 	if (nsflag || nlflag) {
@@ -1719,9 +1915,17 @@ main(
 		inodelog = blocklog - libxfs_highbit32(inopblock);
 		isize = 1 << inodelog;
 	} else if (!ilflag && !isflag) {
-		inodelog = XFS_DINODE_DFL_LOG;
+		inodelog = crcs_enabled ? XFS_DINODE_DFL_CRC_LOG
+					: XFS_DINODE_DFL_LOG;
 		isize = 1 << inodelog;
 	}
+	if (crcs_enabled && inodelog < XFS_DINODE_DFL_CRC_LOG) {
+		fprintf(stderr,
+		_("Minimum inode size for CRCs is %d bytes\n"),
+			1 << XFS_DINODE_DFL_CRC_LOG);
+		usage();
+	}
+
 	if (xi.lisfile && (!logsize || !xi.logname)) {
 		fprintf(stderr,
 		_("if -l file then -l name and -l size are required\n"));
@@ -1801,8 +2005,6 @@ main(
 		int		rswidth;
 		__uint64_t	rtextbytes;
 
-		rswidth = 0;
-
 		if (!norsflag && !xi.risfile && !(!rtsize && xi.disfile))
 			rswidth = ft.rtswidth;
 		else
@@ -1843,7 +2045,7 @@ main(
 			fprintf(stderr,
 	_("allowable inode size with %d byte blocks is between %d and %d\n"),
 				blocksize, XFS_DINODE_MIN_SIZE, maxsz);
-		usage();
+		exit(1);
 	}
 
 	/* if lsu or lsunit was specified, automatically use v2 logs */
@@ -1895,7 +2097,7 @@ main(
 		}
 	}
 
-	if (discard) {
+	if (discard && !Nflag) {
 		discard_blocks(xi.ddev, xi.dsize);
 		if (xi.rtdev)
 			discard_blocks(xi.rtdev, xi.rtsize);
@@ -1970,50 +2172,6 @@ reported by the device (%u).\n"),
 			sectorsize, xi.rtbsize);
 	}
 
-	max_tr_res = max_trans_res(dirversion,
-				   sectorlog, blocklog, inodelog, dirblocklog);
-	ASSERT(max_tr_res);
-	min_logblocks = max_tr_res * XFS_MIN_LOG_FACTOR;
-	min_logblocks = MAX(XFS_MIN_LOG_BLOCKS, min_logblocks);
-	if (!logsize && dblocks >= (1024*1024*1024) >> blocklog)
-		min_logblocks = MAX(min_logblocks, XFS_MIN_LOG_BYTES>>blocklog);
-	if (logsize && xi.logBBsize > 0 && logblocks > DTOBT(xi.logBBsize)) {
-		fprintf(stderr,
-_("size %s specified for log subvolume is too large, maximum is %lld blocks\n"),
-			logsize, (long long)DTOBT(xi.logBBsize));
-		usage();
-	} else if (!logsize && xi.logBBsize > 0) {
-		logblocks = DTOBT(xi.logBBsize);
-	} else if (logsize && !xi.logdev && !loginternal) {
-		fprintf(stderr,
-			_("size specified for non-existent log subvolume\n"));
-		usage();
-	} else if (loginternal && logsize && logblocks >= dblocks) {
-		fprintf(stderr, _("size %lld too large for internal log\n"),
-			(long long)logblocks);
-		usage();
-	} else if (!loginternal && !xi.logdev) {
-		logblocks = 0;
-	} else if (loginternal && !logsize) {
-		/*
-		 * With a 2GB max log size, default to maximum size
-		 * at 4TB. This keeps the same ratio from the older
-		 * max log size of 128M at 256GB fs size. IOWs,
-		 * the ratio of fs size to log size is 2048:1.
-		 */
-		logblocks = (dblocks << blocklog) / 2048;
-		logblocks = logblocks >> blocklog;
-		logblocks = MAX(min_logblocks, logblocks);
-		logblocks = MAX(logblocks,
-				MAX(XFS_DFL_LOG_SIZE,
-					max_tr_res * XFS_DFL_LOG_FACTOR));
-		logblocks = MIN(logblocks, XFS_MAX_LOG_BLOCKS);
-		if ((logblocks << blocklog) > XFS_MAX_LOG_BYTES) {
-			logblocks = XFS_MAX_LOG_BYTES >> blocklog;
-		}
-	}
-	validate_log_size(logblocks, blocklog, min_logblocks);
-
 	if (rtsize && xi.rtsize > 0 && rtblocks > DTOBT(xi.rtsize)) {
 		fprintf(stderr,
 			_("size %s specified for rt subvolume is too large, "
@@ -2034,25 +2192,6 @@ _("size %s specified for log subvolume is too large, maximum is %lld blocks\n"),
 		rtextents = rtblocks = 0;
 		nbmblocks = 0;
 	}
-
-	if (dasize) {		/* User-specified AG size */
-		/*
-		 * Check specified agsize is a multiple of blocksize.
-		 */
-		if (agsize % blocksize) {
-			fprintf(stderr,
-		_("agsize (%lld) not a multiple of fs blk size (%d)\n"),
-				(long long)agsize, blocksize);
-			usage();
-		}
-		agsize /= blocksize;
-		agcount = dblocks / agsize + (dblocks % agsize != 0);
-
-	} else if (daflag)	/* User-specified AG count */
-		agsize = dblocks / agcount + (dblocks % agcount != 0);
-	else
-		calc_default_ag_geometry(blocklog, dblocks,
-				ft.dsunit | ft.dswidth, &agsize, &agcount);
 
 	if (!nodsflag) {
 		if (dsunit) {
@@ -2076,6 +2215,26 @@ _("size %s specified for log subvolume is too large, maximum is %lld blocks\n"),
 			nodsflag = 1;
 		}
 	} /* else dsunit & dswidth can't be set if nodsflag is set */
+
+	if (dasize) {		/* User-specified AG size */
+		/*
+		 * Check specified agsize is a multiple of blocksize.
+		 */
+		if (agsize % blocksize) {
+			fprintf(stderr,
+		_("agsize (%lld) not a multiple of fs blk size (%d)\n"),
+				(long long)agsize, blocksize);
+			usage();
+		}
+		agsize /= blocksize;
+		agcount = dblocks / agsize + (dblocks % agsize != 0);
+
+	} else if (daflag) {	/* User-specified AG count */
+		agsize = dblocks / agcount + (dblocks % agcount != 0);
+	} else {
+		calc_default_ag_geometry(blocklog, dblocks,
+				dsunit | dswidth, &agsize, &agcount);
+	}
 
 	/*
 	 * If dsunit is a multiple of fs blocksize, then check that is a
@@ -2119,9 +2278,12 @@ _("size %s specified for log subvolume is too large, maximum is %lld blocks\n"),
 				if (nodsflag) {
 					dsunit = dswidth = 0;
 				} else {
-					fprintf(stderr,
-_("Allocation group size (%lld) is not a multiple of the stripe unit (%d)\n"),
-						(long long)agsize, dsunit);
+					/*
+					 * agsize is out of bounds, this will
+					 * print nice details & exit.
+					 */
+					validate_ag_geometry(blocklog, dblocks,
+							    agsize, agcount);
 					exit(1);
 				}
 			}
@@ -2218,6 +2380,68 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		fprintf(stderr, _("log stripe unit adjusted to 32KiB\n"));
 	}
 
+	min_logblocks = max_trans_res(crcs_enabled, dirversion,
+				   sectorlog, blocklog, inodelog, dirblocklog,
+				   logversion, lsunit);
+	ASSERT(min_logblocks);
+	min_logblocks = MAX(XFS_MIN_LOG_BLOCKS, min_logblocks);
+	if (!logsize && dblocks >= (1024*1024*1024) >> blocklog)
+		min_logblocks = MAX(min_logblocks, XFS_MIN_LOG_BYTES>>blocklog);
+	if (logsize && xi.logBBsize > 0 && logblocks > DTOBT(xi.logBBsize)) {
+		fprintf(stderr,
+_("size %s specified for log subvolume is too large, maximum is %lld blocks\n"),
+			logsize, (long long)DTOBT(xi.logBBsize));
+		usage();
+	} else if (!logsize && xi.logBBsize > 0) {
+		logblocks = DTOBT(xi.logBBsize);
+	} else if (logsize && !xi.logdev && !loginternal) {
+		fprintf(stderr,
+			_("size specified for non-existent log subvolume\n"));
+		usage();
+	} else if (loginternal && logsize && logblocks >= dblocks) {
+		fprintf(stderr, _("size %lld too large for internal log\n"),
+			(long long)logblocks);
+		usage();
+	} else if (!loginternal && !xi.logdev) {
+		logblocks = 0;
+	} else if (loginternal && !logsize) {
+
+		if (dblocks < GIGABYTES(1, blocklog)) {
+			/* tiny filesystems get minimum sized logs. */
+			logblocks = min_logblocks;
+		} else if (dblocks < GIGABYTES(16, blocklog)) {
+
+			/*
+			 * For small filesystems, we want to use the
+			 * XFS_MIN_LOG_BYTES for filesystems smaller than 16G if
+			 * at all possible, ramping up to 128MB at 256GB.
+			 */
+			logblocks = MIN(XFS_MIN_LOG_BYTES >> blocklog,
+					min_logblocks * XFS_DFL_LOG_FACTOR);
+		} else {
+			/*
+			 * With a 2GB max log size, default to maximum size
+			 * at 4TB. This keeps the same ratio from the older
+			 * max log size of 128M at 256GB fs size. IOWs,
+			 * the ratio of fs size to log size is 2048:1.
+			 */
+			logblocks = (dblocks << blocklog) / 2048;
+			logblocks = logblocks >> blocklog;
+			logblocks = MAX(min_logblocks, logblocks);
+		}
+
+		/* make sure the log fits wholly within an AG */
+		if (logblocks >= agsize)
+			logblocks = min_logblocks;
+
+		/* and now clamp the size to the maximum supported size */
+		logblocks = MIN(logblocks, XFS_MAX_LOG_BLOCKS);
+		if ((logblocks << blocklog) > XFS_MAX_LOG_BYTES)
+			logblocks = XFS_MAX_LOG_BYTES >> blocklog;
+
+	}
+	validate_log_size(logblocks, blocklog, min_logblocks);
+
 	protostring = setup_proto(protofile);
 	bsize = 1 << (blocklog - BBSHIFT);
 	mp = &mbuf;
@@ -2226,8 +2450,33 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	sbp->sb_blocklog = (__uint8_t)blocklog;
 	sbp->sb_sectlog = (__uint8_t)sectorlog;
 	sbp->sb_agblklog = (__uint8_t)libxfs_log2_roundup((unsigned int)agsize);
+	sbp->sb_agblocks = (xfs_agblock_t)agsize;
 	mp->m_blkbb_log = sbp->sb_blocklog - BBSHIFT;
 	mp->m_sectbb_log = sbp->sb_sectlog - BBSHIFT;
+
+	/*
+	 * sb_versionnum and finobt flags must be set before we use
+	 * XFS_PREALLOC_BLOCKS().
+	 */
+	sbp->sb_features2 = XFS_SB_VERSION2_MKFS(crcs_enabled, lazy_sb_counters,
+					attrversion == 2, !projid16bit, 0,
+					(!crcs_enabled && dirftype));
+	sbp->sb_versionnum = XFS_SB_VERSION_MKFS(crcs_enabled, iaflag,
+					dsunit != 0,
+					logversion == 2, attrversion == 1,
+					(sectorsize != BBSIZE ||
+							lsectorsize != BBSIZE),
+					nci, sbp->sb_features2 != 0);
+	/*
+	 * Due to a structure alignment issue, sb_features2 ended up in one
+	 * of two locations, the second "incorrect" location represented by
+	 * the sb_bad_features2 field. To avoid older kernels mounting
+	 * filesystems they shouldn't, set both field to the same value.
+	 */
+	sbp->sb_bad_features2 = sbp->sb_features2;
+
+	if (finobt)
+		sbp->sb_features_ro_compat = XFS_SB_FEAT_RO_COMPAT_FINOBT;
 
 	if (loginternal) {
 		/*
@@ -2236,7 +2485,10 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		 */
 		if (!logsize) {
 			logblocks = MIN(logblocks,
-					agsize - XFS_PREALLOC_BLOCKS(mp));
+					XFS_ALLOC_AG_MAX_USABLE(mp));
+
+			/* revalidate the log size is valid if we changed it */
+			validate_log_size(logblocks, blocklog, min_logblocks);
 		}
 		if (logblocks > agsize - XFS_PREALLOC_BLOCKS(mp)) {
 			fprintf(stderr,
@@ -2244,6 +2496,7 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 				(long long)logblocks);
 			usage();
 		}
+
 		if (laflag) {
 			if (logagno >= agcount) {
 				fprintf(stderr,
@@ -2275,21 +2528,31 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	}
 	validate_log_size(logblocks, blocklog, min_logblocks);
 
+	/*
+	 * dirent filetype field always enabled on v5 superblocks
+	 */
+	if (crcs_enabled) {
+		sbp->sb_features_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+		dirftype = 1;
+	}
+
 	if (!qflag || Nflag) {
 		printf(_(
 		   "meta-data=%-22s isize=%-6d agcount=%lld, agsize=%lld blks\n"
 		   "         =%-22s sectsz=%-5u attr=%u, projid32bit=%u\n"
+		   "         =%-22s crc=%-8u finobt=%u\n"
 		   "data     =%-22s bsize=%-6u blocks=%llu, imaxpct=%u\n"
 		   "         =%-22s sunit=%-6u swidth=%u blks\n"
-		   "naming   =version %-14u bsize=%-6u ascii-ci=%d\n"
+		   "naming   =version %-14u bsize=%-6u ascii-ci=%d ftype=%d\n"
 		   "log      =%-22s bsize=%-6d blocks=%lld, version=%d\n"
 		   "         =%-22s sectsz=%-5u sunit=%d blks, lazy-count=%d\n"
 		   "realtime =%-22s extsz=%-6d blocks=%lld, rtextents=%lld\n"),
 			dfile, isize, (long long)agcount, (long long)agsize,
-			"", sectorsize, attrversion, projid32bit,
+			"", sectorsize, attrversion, !projid16bit,
+			"", crcs_enabled, finobt,
 			"", blocksize, (long long)dblocks, imaxpct,
 			"", dsunit, dswidth,
-			dirversion, dirblocksize, nci,
+			dirversion, dirblocksize, nci, dirftype,
 			logfile, 1 << blocklog, (long long)logblocks,
 			logversion, "", lsectorsize, lsunit, lazy_sb_counters,
 			rtfile, rtextblocks << blocklog,
@@ -2310,7 +2573,6 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	sbp->sb_logstart = logstart;
 	sbp->sb_rootino = sbp->sb_rbmino = sbp->sb_rsumino = NULLFSINO;
 	sbp->sb_rextsize = rtextblocks;
-	sbp->sb_agblocks = (xfs_agblock_t)agsize;
 	sbp->sb_agcount = (xfs_agnumber_t)agcount;
 	sbp->sb_rbmblocks = nbmblocks;
 	sbp->sb_logblocks = (xfs_extlen_t)logblocks;
@@ -2330,7 +2592,7 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	sbp->sb_fdblocks = dblocks - agcount * XFS_PREALLOC_BLOCKS(mp) -
 		(loginternal ? logblocks : 0);
 	sbp->sb_frextents = 0;	/* will do a free later */
-	sbp->sb_uquotino = sbp->sb_gquotino = 0;
+	sbp->sb_uquotino = sbp->sb_gquotino = sbp->sb_pquotino = 0;
 	sbp->sb_qflags = 0;
 	sbp->sb_unit = dsunit;
 	sbp->sb_width = dswidth;
@@ -2341,7 +2603,10 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	} else
 		sbp->sb_logsunit = 0;
 	if (iaflag) {
-		sbp->sb_inoalignmt = XFS_INODE_BIG_CLUSTER_SIZE >> blocklog;
+		int	cluster_size = XFS_INODE_BIG_CLUSTER_SIZE;
+		if (crcs_enabled)
+			cluster_size *= isize / XFS_DINODE_MIN_SIZE;
+		sbp->sb_inoalignmt = cluster_size >> blocklog;
 		iaflag = sbp->sb_inoalignmt != 0;
 	} else
 		sbp->sb_inoalignmt = 0;
@@ -2352,20 +2617,6 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		sbp->sb_logsectlog = 0;
 		sbp->sb_logsectsize = 0;
 	}
-	sbp->sb_features2 = XFS_SB_VERSION2_MKFS(lazy_sb_counters,
-					attrversion == 2, projid32bit == 1, 0);
-	sbp->sb_versionnum = XFS_SB_VERSION_MKFS(iaflag, dsunit != 0,
-					logversion == 2, attrversion == 1,
-					(sectorsize != BBSIZE ||
-							lsectorsize != BBSIZE),
-					nci, sbp->sb_features2 != 0);
-	/*
-	 * Due to a structure alignment issue, sb_features2 ended up in one
-	 * of two locations, the second "incorrect" location represented by
-	 * the sb_bad_features2 field. To avoid older kernels mounting
-	 * filesystems they shouldn't, set both field to the same value.
-	 */
-	sbp->sb_bad_features2 = sbp->sb_features2;
 
 	if (force_overwrite)
 		zero_old_xfs_structures(&xi, sbp);
@@ -2376,16 +2627,19 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	 * swap (somewhere around the page size), jfs (32k),
 	 * ext[2,3] and reiserfs (64k) - and hopefully all else.
 	 */
-	buf = libxfs_getbuf(xi.ddev, 0, BTOBB(WHACK_SIZE));
+	libxfs_buftarg_init(mp, xi.ddev, xi.logdev, xi.rtdev);
+	buf = libxfs_getbuf(mp->m_ddev_targp, 0, BTOBB(WHACK_SIZE));
 	memset(XFS_BUF_PTR(buf), 0, WHACK_SIZE);
 	libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
 	libxfs_purgebuf(buf);
 
 	/* OK, now write the superblock */
-	buf = libxfs_getbuf(xi.ddev, XFS_SB_DADDR, XFS_FSS_TO_BB(mp, 1));
+	buf = libxfs_getbuf(mp->m_ddev_targp, XFS_SB_DADDR, XFS_FSS_TO_BB(mp, 1));
+	buf->b_ops = &xfs_sb_buf_ops;
 	memset(XFS_BUF_PTR(buf), 0, sectorsize);
 	libxfs_sb_to_disk((void *)XFS_BUF_PTR(buf), sbp, XFS_SB_ALL_BITS);
 	libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
+	libxfs_purgebuf(buf);
 
 	/*
 	 * If the data area is a file, then grow it out to its final size
@@ -2401,10 +2655,11 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	/*
 	 * Zero out the end of the device, to obliterate any
 	 * old MD RAID (or other) metadata at the end of the device.
- 	 * (MD sb is ~64k from the end, take out a wider swath to be sure)
+	 * (MD sb is ~64k from the end, take out a wider swath to be sure)
 	 */
 	if (!xi.disfile) {
-		buf = libxfs_getbuf(xi.ddev, (xi.dsize - BTOBB(WHACK_SIZE)),
+		buf = libxfs_getbuf(mp->m_ddev_targp,
+				    (xi.dsize - BTOBB(WHACK_SIZE)),
 				    BTOBB(WHACK_SIZE));
 		memset(XFS_BUF_PTR(buf), 0, WHACK_SIZE);
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2412,29 +2667,36 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	}
 
 	/*
-	 * Zero the log if there is one.
+	 * Zero the log....
 	 */
-	if (loginternal)
-		xi.logdev = xi.ddev;
-	if (xi.logdev)
-		libxfs_log_clear(xi.logdev, XFS_FSB_TO_DADDR(mp, logstart),
-			(xfs_extlen_t)XFS_FSB_TO_BB(mp, logblocks),
-			&sbp->sb_uuid, logversion, lsunit, XLOG_FMT);
+	libxfs_log_clear(mp->m_logdev_targp,
+		XFS_FSB_TO_DADDR(mp, logstart),
+		(xfs_extlen_t)XFS_FSB_TO_BB(mp, logblocks),
+		&sbp->sb_uuid, logversion, lsunit, XLOG_FMT);
 
-	mp = libxfs_mount(mp, sbp, xi.ddev, xi.logdev, xi.rtdev, 1);
+	mp = libxfs_mount(mp, sbp, xi.ddev, xi.logdev, xi.rtdev, 0);
 	if (mp == NULL) {
 		fprintf(stderr, _("%s: filesystem failed to initialize\n"),
 			progname);
 		exit(1);
 	}
 
+	/*
+	 * XXX: this code is effectively shared with the kernel growfs code.
+	 * These initialisations should be pulled into libxfs to keep the
+	 * kernel/userspace header initialisation code the same.
+	 */
 	for (agno = 0; agno < agcount; agno++) {
+		struct xfs_agfl	*agfl;
+		int		bucket;
+
 		/*
 		 * Superblock.
 		 */
-		buf = libxfs_getbuf(xi.ddev,
+		buf = libxfs_getbuf(mp->m_ddev_targp,
 				XFS_AG_DADDR(mp, agno, XFS_SB_DADDR),
 				XFS_FSS_TO_BB(mp, 1));
+		buf->b_ops = &xfs_sb_buf_ops;
 		memset(XFS_BUF_PTR(buf), 0, sectorsize);
 		libxfs_sb_to_disk((void *)XFS_BUF_PTR(buf), sbp, XFS_SB_ALL_BITS);
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2442,9 +2704,10 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		/*
 		 * AG header block: freespace
 		 */
-		buf = libxfs_getbuf(mp->m_dev,
+		buf = libxfs_getbuf(mp->m_ddev_targp,
 				XFS_AG_DADDR(mp, agno, XFS_AGF_DADDR(mp)),
 				XFS_FSS_TO_BB(mp, 1));
+		buf->b_ops = &xfs_agf_buf_ops;
 		agf = XFS_BUF_TO_AGF(buf);
 		memset(agf, 0, sectorsize);
 		if (agno == agcount - 1)
@@ -2463,6 +2726,9 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		nbmblocks = (xfs_extlen_t)(agsize - XFS_PREALLOC_BLOCKS(mp));
 		agf->agf_freeblks = cpu_to_be32(nbmblocks);
 		agf->agf_longest = cpu_to_be32(nbmblocks);
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			platform_uuid_copy(&agf->agf_uuid, &mp->m_sb.sb_uuid);
+
 		if (loginternal && agno == logagno) {
 			be32_add_cpu(&agf->agf_freeblks, -logblocks);
 			agf->agf_longest = cpu_to_be32(agsize -
@@ -2473,12 +2739,33 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
 
 		/*
+		 * AG freelist header block
+		 */
+		buf = libxfs_getbuf(mp->m_ddev_targp,
+				XFS_AG_DADDR(mp, agno, XFS_AGFL_DADDR(mp)),
+				XFS_FSS_TO_BB(mp, 1));
+		buf->b_ops = &xfs_agfl_buf_ops;
+		agfl = XFS_BUF_TO_AGFL(buf);
+		/* setting to 0xff results in initialisation to NULLAGBLOCK */
+		memset(agfl, 0xff, sectorsize);
+		if (xfs_sb_version_hascrc(&mp->m_sb)) {
+			agfl->agfl_magicnum = cpu_to_be32(XFS_AGFL_MAGIC);
+			agfl->agfl_seqno = cpu_to_be32(agno);
+			platform_uuid_copy(&agfl->agfl_uuid, &mp->m_sb.sb_uuid);
+			for (bucket = 0; bucket < XFS_AGFL_SIZE(mp); bucket++)
+				agfl->agfl_bno[bucket] = cpu_to_be32(NULLAGBLOCK);
+		}
+
+		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
+
+		/*
 		 * AG header block: inodes
 		 */
-		buf = libxfs_getbuf(mp->m_dev,
+		buf = libxfs_getbuf(mp->m_ddev_targp,
 				XFS_AG_DADDR(mp, agno, XFS_AGI_DADDR(mp)),
 				XFS_FSS_TO_BB(mp, 1));
 		agi = XFS_BUF_TO_AGI(buf);
+		buf->b_ops = &xfs_agi_buf_ops;
 		memset(agi, 0, sectorsize);
 		agi->agi_magicnum = cpu_to_be32(XFS_AGI_MAGIC);
 		agi->agi_versionnum = cpu_to_be32(XFS_AGI_VERSION);
@@ -2487,9 +2774,15 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		agi->agi_count = 0;
 		agi->agi_root = cpu_to_be32(XFS_IBT_BLOCK(mp));
 		agi->agi_level = cpu_to_be32(1);
+		if (finobt) {
+			agi->agi_free_root = cpu_to_be32(XFS_FIBT_BLOCK(mp));
+			agi->agi_free_level = cpu_to_be32(1);
+		}
 		agi->agi_freecount = 0;
 		agi->agi_newino = cpu_to_be32(NULLAGINO);
 		agi->agi_dirino = cpu_to_be32(NULLAGINO);
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			platform_uuid_copy(&agi->agi_uuid, &mp->m_sb.sb_uuid);
 		for (c = 0; c < XFS_AGI_UNLINKED_BUCKETS; c++)
 			agi->agi_unlinked[c] = cpu_to_be32(NULLAGINO);
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2497,16 +2790,19 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		/*
 		 * BNO btree root block
 		 */
-		buf = libxfs_getbuf(mp->m_dev,
+		buf = libxfs_getbuf(mp->m_ddev_targp,
 				XFS_AGB_TO_DADDR(mp, agno, XFS_BNO_BLOCK(mp)),
 				bsize);
+		buf->b_ops = &xfs_allocbt_buf_ops;
 		block = XFS_BUF_TO_BLOCK(buf);
 		memset(block, 0, blocksize);
-		block->bb_magic = cpu_to_be32(XFS_ABTB_MAGIC);
-		block->bb_level = 0;
-		block->bb_numrecs = cpu_to_be16(1);
-		block->bb_u.s.bb_leftsib = cpu_to_be32(NULLAGBLOCK);
-		block->bb_u.s.bb_rightsib = cpu_to_be32(NULLAGBLOCK);
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			xfs_btree_init_block(mp, buf, XFS_ABTB_CRC_MAGIC, 0, 1,
+						agno, XFS_BTREE_CRC_BLOCKS);
+		else
+			xfs_btree_init_block(mp, buf, XFS_ABTB_MAGIC, 0, 1,
+						agno, 0);
+
 		arec = XFS_ALLOC_REC_ADDR(mp, block, 1);
 		arec->ar_startblock = cpu_to_be32(XFS_PREALLOC_BLOCKS(mp));
 		if (loginternal && agno == logagno) {
@@ -2533,23 +2829,35 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 			 */
 			be32_add_cpu(&arec->ar_startblock, logblocks);
 		}
+		/*
+		 * Calculate the record block count and check for the case where
+		 * the log might have consumed all available space in the AG. If
+		 * so, reset the record count to 0 to avoid exposure of an invalid
+		 * record start block.
+		 */
 		arec->ar_blockcount = cpu_to_be32(agsize - 
 					be32_to_cpu(arec->ar_startblock));
+		if (!arec->ar_blockcount)
+			block->bb_numrecs = 0;
+
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
 
 		/*
 		 * CNT btree root block
 		 */
-		buf = libxfs_getbuf(mp->m_dev,
+		buf = libxfs_getbuf(mp->m_ddev_targp,
 				XFS_AGB_TO_DADDR(mp, agno, XFS_CNT_BLOCK(mp)),
 				bsize);
+		buf->b_ops = &xfs_allocbt_buf_ops;
 		block = XFS_BUF_TO_BLOCK(buf);
 		memset(block, 0, blocksize);
-		block->bb_magic = cpu_to_be32(XFS_ABTC_MAGIC);
-		block->bb_level = 0;
-		block->bb_numrecs = cpu_to_be16(1);
-		block->bb_u.s.bb_leftsib = cpu_to_be32(NULLAGBLOCK);
-		block->bb_u.s.bb_rightsib = cpu_to_be32(NULLAGBLOCK);
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			xfs_btree_init_block(mp, buf, XFS_ABTC_CRC_MAGIC, 0, 1,
+						agno, XFS_BTREE_CRC_BLOCKS);
+		else
+			xfs_btree_init_block(mp, buf, XFS_ABTC_MAGIC, 0, 1,
+						agno, 0);
+
 		arec = XFS_ALLOC_REC_ADDR(mp, block, 1);
 		arec->ar_startblock = cpu_to_be32(XFS_PREALLOC_BLOCKS(mp));
 		if (loginternal && agno == logagno) {
@@ -2566,30 +2874,61 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 			}
 			be32_add_cpu(&arec->ar_startblock, logblocks);
 		}
+		/*
+		 * Calculate the record block count and check for the case where
+		 * the log might have consumed all available space in the AG. If
+		 * so, reset the record count to 0 to avoid exposure of an invalid
+		 * record start block.
+		 */
 		arec->ar_blockcount = cpu_to_be32(agsize - 
 					be32_to_cpu(arec->ar_startblock));
+		if (!arec->ar_blockcount)
+			block->bb_numrecs = 0;
+
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
 
 		/*
 		 * INO btree root block
 		 */
-		buf = libxfs_getbuf(mp->m_dev,
+		buf = libxfs_getbuf(mp->m_ddev_targp,
 				XFS_AGB_TO_DADDR(mp, agno, XFS_IBT_BLOCK(mp)),
 				bsize);
+		buf->b_ops = &xfs_inobt_buf_ops;
 		block = XFS_BUF_TO_BLOCK(buf);
 		memset(block, 0, blocksize);
-		block->bb_magic = cpu_to_be32(XFS_IBT_MAGIC);
-		block->bb_level = 0;
-		block->bb_numrecs = 0;
-		block->bb_u.s.bb_leftsib = cpu_to_be32(NULLAGBLOCK);
-		block->bb_u.s.bb_rightsib = cpu_to_be32(NULLAGBLOCK);
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			xfs_btree_init_block(mp, buf, XFS_IBT_CRC_MAGIC, 0, 0,
+						agno, XFS_BTREE_CRC_BLOCKS);
+		else
+			xfs_btree_init_block(mp, buf, XFS_IBT_MAGIC, 0, 0,
+						agno, 0);
+		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
+
+		/*
+		 * Free INO btree root block
+		 */
+		if (!finobt)
+			continue;
+
+		buf = libxfs_getbuf(mp->m_ddev_targp,
+				XFS_AGB_TO_DADDR(mp, agno, XFS_FIBT_BLOCK(mp)),
+				bsize);
+		buf->b_ops = &xfs_inobt_buf_ops;
+		block = XFS_BUF_TO_BLOCK(buf);
+		memset(block, 0, blocksize);
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			xfs_btree_init_block(mp, buf, XFS_FIBT_CRC_MAGIC, 0, 0,
+						agno, XFS_BTREE_CRC_BLOCKS);
+		else
+			xfs_btree_init_block(mp, buf, XFS_FIBT_MAGIC, 0, 0,
+						agno, 0);
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
 	}
 
 	/*
 	 * Touch last block, make fs the right size if it's a file.
 	 */
-	buf = libxfs_getbuf(mp->m_dev,
+	buf = libxfs_getbuf(mp->m_ddev_targp,
 		(xfs_daddr_t)XFS_FSB_TO_BB(mp, dblocks - 1LL), bsize);
 	memset(XFS_BUF_PTR(buf), 0, blocksize);
 	libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2597,8 +2936,8 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	/*
 	 * Make sure we can write the last block in the realtime area.
 	 */
-	if (mp->m_rtdev && rtblocks > 0) {
-		buf = libxfs_getbuf(mp->m_rtdev,
+	if (mp->m_rtdev_targp->dev && rtblocks > 0) {
+		buf = libxfs_getbuf(mp->m_rtdev_targp,
 				XFS_FSB_TO_BB(mp, rtblocks - 1LL), bsize);
 		memset(XFS_BUF_PTR(buf), 0, blocksize);
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2610,6 +2949,7 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	for (agno = 0; agno < agcount; agno++) {
 		xfs_alloc_arg_t	args;
 		xfs_trans_t	*tp;
+		struct xfs_trans_res tres = {0};
 
 		memset(&args, 0, sizeof(args));
 		args.tp = tp = libxfs_trans_alloc(mp, 0);
@@ -2617,8 +2957,10 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 		args.agno = agno;
 		args.alignment = 1;
 		args.pag = xfs_perag_get(mp,agno);
-		if ((c = libxfs_trans_reserve(tp, worst_freelist, 0, 0, 0, 0)))
+		c = libxfs_trans_reserve(tp, &tres, worst_freelist, 0);
+		if (c)
 			res_failed(c);
+
 		libxfs_alloc_fix_freelist(&args, 0);
 		xfs_perag_put(args.pag);
 		libxfs_trans_commit(tp, 0);
@@ -2627,7 +2969,6 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	/*
 	 * Allocate the root inode and anything else in the proto file.
 	 */
-	mp->m_rootip = NULL;
 	parse_proto(mp, &fsx, &protostring);
 
 	/*
@@ -2651,7 +2992,7 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 				XFS_AGB_TO_DADDR(mp, mp->m_sb.sb_agcount-1,
 					XFS_SB_DADDR),
 				XFS_FSS_TO_BB(mp, 1),
-				LIBXFS_EXIT_ON_FAILURE);
+				LIBXFS_EXIT_ON_FAILURE, &xfs_sb_buf_ops);
 		XFS_BUF_TO_SBP(buf)->sb_rootino = cpu_to_be64(
 							mp->m_sb.sb_rootino);
 		libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2663,7 +3004,7 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 				XFS_AGB_TO_DADDR(mp, (mp->m_sb.sb_agcount-1)/2,
 					XFS_SB_DADDR),
 				XFS_FSS_TO_BB(mp, 1),
-				LIBXFS_EXIT_ON_FAILURE);
+				LIBXFS_EXIT_ON_FAILURE, &xfs_sb_buf_ops);
 			XFS_BUF_TO_SBP(buf)->sb_rootino = cpu_to_be64(
 							mp->m_sb.sb_rootino);
 			libxfs_writebuf(buf, LIBXFS_EXIT_ON_FAILURE);
@@ -2675,7 +3016,6 @@ an AG size that is one stripe unit smaller, for example %llu.\n"),
 	 * Need to drop references to inodes we still hold, first.
 	 */
 	libxfs_rtmount_destroy(mp);
-	libxfs_icache_purge();
 	libxfs_bcache_purge();
 
 	/*
@@ -2819,16 +3159,20 @@ usage( void )
 {
 	fprintf(stderr, _("Usage: %s\n\
 /* blocksize */		[-b log=n|size=num]\n\
+/* metadata */		[-m crc=0|1,finobt=0|1]\n\
 /* data subvol */	[-d agcount=n,agsize=n,file,name=xxx,size=num,\n\
-			    (sunit=value,swidth=value|su=num,sw=num),\n\
+			    (sunit=value,swidth=value|su=num,sw=num|noalign),\n\
 			    sectlog=n|sectsize=num\n\
+/* force overwrite */	[-f]\n\
 /* inode size */	[-i log=n|perblock=n|size=num,maxpct=n,attr=0|1|2,\n\
 			    projid32bit=0|1]\n\
+/* no discard */	[-K]\n\
 /* log subvol */	[-l agnum=n,internal,size=num,logdev=xxx,version=n\n\
 			    sunit=value|su=num,sectlog=n|sectsize=num,\n\
 			    lazy-count=0|1]\n\
 /* label */		[-L label (maximum 12 characters)]\n\
-/* naming */		[-n log=n|size=num,version=2|ci]\n\
+/* naming */		[-n log=n|size=num,version=2|ci,ftype=0|1]\n\
+/* no-op info only */	[-N]\n\
 /* prototype file */	[-p fname]\n\
 /* quiet */		[-q]\n\
 /* realtime subvol */	[-r extsize=num,size=num,rtdev=xxx]\n\

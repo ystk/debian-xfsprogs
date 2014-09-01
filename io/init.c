@@ -32,7 +32,7 @@ void
 usage(void)
 {
 	fprintf(stderr,
-		_("Usage: %s [-adFfmrRstx] [-p prog] [-c cmd]... file\n"),
+		_("Usage: %s [-adfmnrRstVx] [-p prog] [-c cmd]... file\n"),
 		progname);
 	exit(1);
 }
@@ -58,12 +58,14 @@ init_commands(void)
 	bmap_init();
 	fadvise_init();
 	file_init();
+	flink_init();
 	freeze_init();
 	fsync_init();
 	getrusage_init();
 	help_init();
 	imap_init();
 	inject_init();
+	seek_init();
 	madvise_init();
 	mincore_init();
 	mmap_init();
@@ -74,10 +76,12 @@ init_commands(void)
 	fiemap_init();
 	pwrite_init();
 	quit_init();
+	readdir_init();
 	resblks_init();
 	sendfile_init();
 	shutdown_init();
 	truncate_init();
+	sync_range_init();
 }
 
 static int
@@ -133,7 +137,7 @@ init(
 	pagesize = getpagesize();
 	gettimeofday(&stopwatch, NULL);
 
-	while ((c = getopt(argc, argv, "ac:dFfmp:nrRstVx")) != EOF) {
+	while ((c = getopt(argc, argv, "ac:dFfmp:nrRstTVx")) != EOF) {
 		switch (c) {
 		case 'a':
 			flags |= IO_APPEND;
@@ -145,7 +149,7 @@ init(
 			flags |= IO_DIRECT;
 			break;
 		case 'F':
-			flags |= IO_FOREIGN;
+			/* Ignored / deprecated now, handled automatically */
 			break;
 		case 'f':
 			flags |= IO_CREAT;
@@ -176,6 +180,9 @@ init(
 		case 'R':
 			flags |= IO_REALTIME;
 			break;
+		case 'T':
+			flags |= IO_TMPFILE;
+			break;
 		case 'x':
 			expert = 1;
 			break;
@@ -188,9 +195,10 @@ init(
 	}
 
 	while (optind < argc) {
-		if ((c = openfile(argv[optind], flags & IO_FOREIGN ?
-					NULL : &geometry, flags, mode)) < 0)
+		if ((c = openfile(argv[optind], &geometry, flags, mode)) < 0)
 			exit(1);
+		if (!platform_test_xfs_fd(c))
+			flags |= IO_FOREIGN;
 		if (addfile(argv[optind], c, &geometry, flags) < 0)
 			exit(1);
 		optind++;

@@ -16,6 +16,7 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <sys/uio.h>
 #include <xfs/xfs.h>
 #include <xfs/command.h>
 #include <xfs/input.h>
@@ -46,6 +47,10 @@ pread_help(void)
 " -R   -- read at random offsets in the range of bytes\n"
 " -Z N -- zeed the random number generator (used when reading randomly)\n"
 "         (heh, zorry, the -s/-S arguments were already in use in pwrite)\n"
+#ifdef HAVE_PREADV
+" -V N -- use vectored IO with N iovecs of blocksize each (preadv)\n"
+#endif
+"\n"
 " When in \"random\" mode, the number of read operations will equal the\n"
 " number required to do a complete forward/backward scan of the range.\n"
 " Note that the offset within the range is chosen at random each time\n"
@@ -56,6 +61,41 @@ pread_help(void)
 void	*buffer;
 size_t	highwater;
 size_t	buffersize;
+int	vectors;
+struct iovec *iov;
+
+static int
+alloc_iovec(
+	size_t		bsize,
+	int		uflag,
+	unsigned int	seed)
+{
+	int		i;
+
+	iov = calloc(vectors, sizeof(struct iovec));
+	if (!iov)
+		return -1;
+
+	buffersize = 0;
+	for (i = 0; i < vectors; i++) {
+		iov[i].iov_base = memalign(pagesize, bsize);
+		if (!iov[i].iov_base) {
+			perror("memalign");
+			goto unwind;
+		}
+		iov[i].iov_len = bsize;
+		if (!uflag)
+			memset(iov[i].iov_base, seed, bsize);
+	}
+	buffersize = bsize * vectors;
+	return 0;
+unwind:
+	for( ; i >= 0; i--)
+		free(iov[i].iov_base);
+	free(iov);
+	iov = NULL;
+	return -1;
+}
 
 int
 alloc_buffer(
@@ -63,6 +103,9 @@ alloc_buffer(
 	int		uflag,
 	unsigned int	seed)
 {
+	if (vectors)
+		return alloc_iovec(bsize, uflag, seed);
+
 	if (bsize > highwater) {
 		if (buffer)
 			free(buffer);
@@ -81,14 +124,15 @@ alloc_buffer(
 }
 
 void
-dump_buffer(
+__dump_buffer(
+	void		*buf,
 	off64_t		offset,
 	ssize_t		len)
 {
 	int		i, j;
 	char		*p;
 
-	for (i = 0, p = (char *)buffer; i < len; i += 16) {
+	for (i = 0, p = (char *)buf; i < len; i += 16) {
 		char	*s = p;
 
 		printf("%08llx:  ", (unsigned long long)offset + i);
@@ -103,6 +147,77 @@ dump_buffer(
 		}
 		printf("\n");
 	}
+}
+
+void
+dump_buffer(
+	off64_t		offset,
+	ssize_t		len)
+{
+	int		i, l;
+
+	if (!vectors) {
+		__dump_buffer(buffer, offset, len);
+		return;
+	}
+
+	for (i = 0; len > 0 && i < vectors; i++) {
+		l = min(len, iov[i].iov_len);
+
+		__dump_buffer(iov[i].iov_base, offset, l);
+		len -= l;
+		offset += l;
+	}
+}
+
+#ifdef HAVE_PREADV
+static int
+do_preadv(
+	int		fd,
+	off64_t		offset,
+	ssize_t		count,
+	ssize_t		buffer_size)
+{
+	int		vecs = 0;
+	ssize_t		oldlen = 0;
+	ssize_t		bytes = 0;
+
+	/* trim the iovec if necessary */
+	if (count < buffersize) {
+		size_t	len = 0;
+		while (len + iov[vecs].iov_len < count) {
+			len += iov[vecs].iov_len;
+			vecs++;
+		}
+		oldlen = iov[vecs].iov_len;
+		iov[vecs].iov_len = count - len;
+		vecs++;
+	} else {
+		vecs = vectors;
+	}
+	bytes = preadv(fd, iov, vectors, offset);
+
+	/* restore trimmed iov */
+	if (oldlen)
+		iov[vecs - 1].iov_len = oldlen;
+
+	return bytes;
+}
+#else
+#define do_preadv(fd, offset, count, buffer_size) (0)
+#endif
+
+static int
+do_pread(
+	int		fd,
+	off64_t		offset,
+	ssize_t		count,
+	ssize_t		buffer_size)
+{
+	if (!vectors)
+		return pread64(fd, buffer, min(count, buffer_size), offset);
+
+	return do_preadv(fd, offset, count, buffer_size);
 }
 
 static int
@@ -131,8 +246,8 @@ read_random(
 
 	*total = 0;
 	while (count > 0) {
-		off = ((random() % range) / buffersize) * buffersize;
-		bytes = pread64(fd, buffer, buffersize, off);
+		off = ((offset + (random() % range)) / buffersize) * buffersize;
+		bytes = do_pread(fd, off, buffersize, buffersize);
 		if (bytes == 0)
 			break;
 		if (bytes < 0) {
@@ -173,9 +288,8 @@ read_backward(
 
 	/* Do initial unaligned read if needed */
 	if ((bytes_requested = (off % buffersize))) {
-		bytes_requested = min(cnt, bytes_requested);
 		off -= bytes_requested;
-		bytes = pread(fd, buffer, bytes_requested, off);
+		bytes = do_pread(fd, off, bytes_requested, buffersize);
 		if (bytes == 0)
 			return ops;
 		if (bytes < 0) {
@@ -193,7 +307,7 @@ read_backward(
 	while (cnt > end) {
 		bytes_requested = min(cnt, buffersize);
 		off -= bytes_requested;
-		bytes = pread64(fd, buffer, bytes_requested, off);
+		bytes = do_pread(fd, off, cnt, buffersize);
 		if (bytes == 0)
 			break;
 		if (bytes < 0) {
@@ -219,14 +333,12 @@ read_forward(
 	int		onlyone,
 	int		eof)
 {
-	size_t		bytes_requested;
 	ssize_t		bytes;
 	int		ops = 0;
 
 	*total = 0;
 	while (count > 0 || eof) {
-		bytes_requested = min(count, buffersize);
-		bytes = pread64(fd, buffer, bytes_requested, offset);
+		bytes = do_pread(fd, offset, count, buffersize);
 		if (bytes == 0)
 			break;
 		if (bytes < 0) {
@@ -237,7 +349,7 @@ read_forward(
 		if (verbose)
 			dump_buffer(offset, bytes);
 		*total += bytes;
-		if (onlyone || bytes < bytes_requested)
+		if (onlyone || bytes < min(count, buffersize))
 			break;
 		offset += bytes;
 		count -= bytes;
@@ -278,7 +390,7 @@ pread_f(
 	init_cvtnum(&fsblocksize, &fssectsize);
 	bsize = fsblocksize;
 
-	while ((c = getopt(argc, argv, "b:BCFRquvZ:")) != EOF) {
+	while ((c = getopt(argc, argv, "b:BCFRquvV:Z:")) != EOF) {
 		switch (c) {
 		case 'b':
 			tmp = cvtnum(fsblocksize, fssectsize, optarg);
@@ -309,6 +421,16 @@ pread_f(
 		case 'v':
 			vflag = 1;
 			break;
+#ifdef HAVE_PREADV
+		case 'V':
+			vectors = strtoul(optarg, &sp, 0);
+			if (!sp || sp == optarg) {
+				printf(_("non-numeric vector count == %s\n"),
+					optarg);
+				return 0;
+			}
+			break;
+#endif
 		case 'Z':
 			zeed = strtoul(optarg, &sp, 0);
 			if (!sp || sp == optarg) {
@@ -393,7 +515,7 @@ pread_init(void)
 	pread_cmd.argmin = 2;
 	pread_cmd.argmax = -1;
 	pread_cmd.flags = CMD_NOMAP_OK | CMD_FOREIGN_OK;
-	pread_cmd.args = _("[-b bs] [-v] off len");
+	pread_cmd.args = _("[-b bs] [-v] [-i N] [-FBR [-Z N]] off len");
 	pread_cmd.oneline = _("reads a number of bytes at a specified offset");
 	pread_cmd.help = pread_help;
 

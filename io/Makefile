@@ -9,8 +9,9 @@ LTCOMMAND = xfs_io
 LSRCFILES = xfs_bmap.sh xfs_freeze.sh xfs_mkfile.sh
 HFILES = init.h io.h
 CFILES = init.c \
-	attr.c bmap.c file.c freeze.c fsync.c getrusage.c imap.c mmap.c \
-	open.c parent.c pread.c prealloc.c pwrite.c shutdown.c truncate.c
+	attr.c bmap.c file.c freeze.c fsync.c getrusage.c imap.c link.c \
+	mmap.c open.c parent.c pread.c prealloc.c pwrite.c seek.c shutdown.c \
+	truncate.c
 
 LLDLIBS = $(LIBXCMD) $(LIBHANDLE)
 LTDEPENDENCIES = $(LIBXCMD) $(LIBHANDLE)
@@ -58,6 +59,11 @@ CFILES += inject.c resblks.c
 LCFLAGS += -DHAVE_INJECT -DHAVE_RESBLKS
 endif
 
+ifeq ($(HAVE_SYNC_FILE_RANGE),yes)
+CFILES += sync_file_range.c
+LCFLAGS += -DHAVE_SYNC_FILE_RANGE
+endif
+
 ifeq ($(ENABLE_READLINE),yes)
 LLDLIBS += $(LIBREADLINE) $(LIBTERMCAP)
 endif
@@ -68,6 +74,16 @@ endif
 
 ifeq ($(HAVE_FALLOCATE),yes)
 LCFLAGS += -DHAVE_FALLOCATE
+endif
+
+# Also implies PWRITEV
+ifeq ($(HAVE_PREADV),yes)
+LCFLAGS += -DHAVE_PREADV -DHAVE_PWRITEV
+endif
+
+ifeq ($(HAVE_READDIR),yes)
+CFILES += readdir.c
+LCFLAGS += -DHAVE_READDIR
 endif
 
 default: depend $(LTCOMMAND)

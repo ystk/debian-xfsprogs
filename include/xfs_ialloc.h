@@ -23,6 +23,7 @@ struct xfs_dinode;
 struct xfs_imap;
 struct xfs_mount;
 struct xfs_trans;
+struct xfs_btree_cur;
 
 /*
  * Allocation parameters for inode allocation.
@@ -42,18 +43,9 @@ struct xfs_trans;
 static inline struct xfs_dinode *
 xfs_make_iptr(struct xfs_mount *mp, struct xfs_buf *b, int o)
 {
-	return (xfs_dinode_t *)
+	return (struct xfs_dinode *)
 		(xfs_buf_offset(b, o << (mp)->m_sb.sb_inodelog));
 }
-
-/*
- * Find a free (set) bit in the inode bitmask.
- */
-static inline int xfs_ialloc_find_free(xfs_inofree_t *fp)
-{
-	return xfs_lowbit64(*fp);
-}
-
 
 /*
  * Allocate an inode on disk.
@@ -81,11 +73,9 @@ int					/* error */
 xfs_dialloc(
 	struct xfs_trans *tp,		/* transaction pointer */
 	xfs_ino_t	parent,		/* parent inode (directory) */
-	mode_t		mode,		/* mode bits for new inode */
+	umode_t		mode,		/* mode bits for new inode */
 	int		okalloc,	/* ok to allocate more space */
 	struct xfs_buf	**agbp,		/* buf for a.g. inode header */
-	boolean_t	*alloc_done,	/* an allocation was done to replenish
-					   the free inodes */
 	xfs_ino_t	*inop);		/* inode number allocated */
 
 /*
@@ -99,7 +89,7 @@ xfs_difree(
 	struct xfs_trans *tp,		/* transaction pointer */
 	xfs_ino_t	inode,		/* inode to be freed */
 	struct xfs_bmap_free *flist,	/* extents to free */
-	int		*delete,	/* set if inode cluster was deleted */
+	int		*deleted,	/* set if inode cluster was deleted */
 	xfs_ino_t	*first_ino);	/* first inode in deleted cluster */
 
 /*
@@ -158,7 +148,15 @@ int xfs_inobt_lookup(struct xfs_btree_cur *cur, xfs_agino_t ino,
 /*
  * Get the data from the pointed-to record.
  */
-extern int xfs_inobt_get_rec(struct xfs_btree_cur *cur,
+int xfs_inobt_get_rec(struct xfs_btree_cur *cur,
 		xfs_inobt_rec_incore_t *rec, int *stat);
+
+/*
+ * Inode chunk initialisation routine
+ */
+int xfs_ialloc_inode_init(struct xfs_mount *mp, struct xfs_trans *tp,
+			  struct list_head *buffer_list,
+			  xfs_agnumber_t agno, xfs_agblock_t agbno,
+			  xfs_agblock_t length, unsigned int gen);
 
 #endif	/* __XFS_IALLOC_H__ */

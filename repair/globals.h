@@ -49,7 +49,8 @@
 #define XR_BAD_SB_UNIT		17	/* bad stripe unit */
 #define XR_BAD_SB_WIDTH		18	/* bad stripe width */
 #define XR_BAD_SVN		19	/* bad shared version number */
-#define XR_BAD_ERR_CODE		20	/* Bad error code */
+#define XR_BAD_CRC		20	/* Bad CRC */
+#define XR_BAD_ERR_CODE		21	/* Bad error code */
 
 /* XFS filesystem (il)legal values */
 
@@ -137,6 +138,7 @@ EXTERN int		need_rsumino;
 EXTERN int		lost_quotas;
 EXTERN int		have_uquotino;
 EXTERN int		have_gquotino;
+EXTERN int		have_pquotino;
 EXTERN int		lost_uquotino;
 EXTERN int		lost_gquotino;
 EXTERN int		lost_pquotino;
@@ -185,11 +187,10 @@ EXTERN xfs_extlen_t	sb_inoalignmt;
 EXTERN __uint32_t	sb_unit;
 EXTERN __uint32_t	sb_width;
 
-extern size_t 		ts_dirbuf_size;
-extern size_t 		ts_dir_freemap_size;
-extern size_t 		ts_attr_freemap_size;
-
-EXTERN pthread_mutex_t	*ag_locks;
+struct aglock {
+	pthread_mutex_t	lock __attribute__((__aligned__(64)));
+};
+EXTERN struct aglock	*ag_locks;
 
 EXTERN int 		report_interval;
 EXTERN __uint64_t 	*prog_rpt_done;

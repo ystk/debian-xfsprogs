@@ -45,7 +45,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-		_("Usage: %s [-p prog] [-c cmd]... [-d project]... [path]\n"),
+		_("Usage: %s [-V] [-x] [-p prog] [-c cmd]... [-d project]... [path]\n"),
 		progname);
 	exit(1);
 }
@@ -140,6 +140,15 @@ init(
 
 	init_commands();
 	add_args_command(init_args_command);
+
+	/*
+	 * Ensure that global commands don't end up with an invalid path pointer
+	 * by setting the default device at the first specified on the CLI
+	 */
+	if (argc != optind)
+		fs_path = fs_table_lookup(argv[optind], FS_MOUNT_POINT);
+	else
+		fs_path = &fs_table[0];
 }
 
 int

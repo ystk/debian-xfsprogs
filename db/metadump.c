@@ -26,6 +26,10 @@
 #include "init.h"
 #include "sig.h"
 #include "xfs_metadump.h"
+#include "fprint.h"
+#include "faddr.h"
+#include "field.h"
+#include "dir2.h"
 
 #define DEFAULT_MAX_EXT_SIZE	1000
 
@@ -141,6 +145,8 @@ print_progress(const char *fmt, ...)
  * even if the dump is exactly aligned, the last index will be full of
  * zeros. If the last index entry is non-zero, the dump is incomplete.
  * Correspondingly, the last chunk will have a count < num_indicies.
+ *
+ * Return 0 for success, -1 for failure.
  */
 
 static int
@@ -152,33 +158,88 @@ write_index(void)
 	metablock->mb_count = cpu_to_be16(cur_index);
 	if (fwrite(metablock, (cur_index + 1) << BBSHIFT, 1, outf) != 1) {
 		print_warning("error writing to file: %s", strerror(errno));
-		return 0;
+		return -errno;
 	}
 
 	memset(block_index, 0, num_indicies * sizeof(__be64));
 	cur_index = 0;
-	return 1;
+	return 0;
 }
 
+/*
+ * Return 0 for success, -errno for failure.
+ */
+static int
+write_buf_segment(
+	char		*data,
+	__int64_t	off,
+	int		len)
+{
+	int		i;
+	int		ret;
+
+	for (i = 0; i < len; i++, off++, data += BBSIZE) {
+		block_index[cur_index] = cpu_to_be64(off);
+		memcpy(&block_buffer[cur_index << BBSHIFT], data, BBSIZE);
+		if (++cur_index == num_indicies) {
+			ret = write_index();
+			if (ret)
+				return -EIO;
+		}
+	}
+	return 0;
+}
+
+/*
+ * we want to preserve the state of the metadata in the dump - whether it is
+ * intact or corrupt, so even if the buffer has a verifier attached to it we
+ * don't want to run it prior to writing the buffer to the metadump image.
+ *
+ * The only reason for running the verifier is to recalculate the CRCs on a
+ * buffer that has been obfuscated. i.e. a buffer than metadump modified itself.
+ * In this case, we only run the verifier if the buffer was not corrupt to begin
+ * with so that we don't accidentally correct buffers with CRC or errors in them
+ * when we are obfuscating them.
+ */
 static int
 write_buf(
 	iocur_t		*buf)
 {
-	char		*data;
-	__int64_t	off;
+	struct xfs_buf	*bp = buf->bp;
 	int		i;
+	int		ret;
 
-	for (i = 0, off = buf->bb, data = buf->data;
-			i < buf->blen;
-			i++, off++, data += BBSIZE) {
-		block_index[cur_index] = cpu_to_be64(off);
-		memcpy(&block_buffer[cur_index << BBSHIFT], data, BBSIZE);
-		if (++cur_index == num_indicies) {
-			if (!write_index())
-				return 0;
+	/*
+	 * Run the write verifier to recalculate the buffer CRCs and check
+	 * metadump didn't introduce a new corruption. Warn if the verifier
+	 * failed, but still continue to dump it into the output file.
+	 */
+	if (buf->need_crc && bp && bp->b_ops && !bp->b_error) {
+		bp->b_ops->verify_write(bp);
+		if (bp->b_error) {
+			print_warning(
+				"obfuscation corrupted block at bno 0x%llx/0x%x",
+				(long long)bp->b_bn, bp->b_bcount);
 		}
 	}
-	return !seenint();
+
+	/* handle discontiguous buffers */
+	if (!buf->bbmap) {
+		ret = write_buf_segment(buf->data, buf->bb, buf->blen);
+		if (ret)
+			return ret;
+	} else {
+		int	len = 0;
+		for (i = 0; i < buf->bbmap->nmaps; i++) {
+			ret = write_buf_segment(buf->data + BBTOB(len),
+						buf->bbmap->b[i].bm_bn,
+						buf->bbmap->b[i].bm_len);
+			if (ret)
+				return ret;
+			len += buf->bbmap->b[i].bm_len;
+		}
+	}
+	return seenint() ? -EINTR : 0;
 }
 
 
@@ -207,7 +268,7 @@ scan_btree(
 		rval = !stop_on_read_error;
 		goto pop_out;
 	}
-	if (!write_buf(iocur_top))
+	if (write_buf(iocur_top))
 		goto pop_out;
 
 	if (!(*func)(iocur_top->data, agno, agbno, level - 1, btype, arg))
@@ -902,12 +963,12 @@ static void
 obfuscate_sf_dir(
 	xfs_dinode_t		*dip)
 {
-	xfs_dir2_sf_t		*sfp;
+	struct xfs_dir2_sf_hdr	*sfp;
 	xfs_dir2_sf_entry_t	*sfep;
 	__uint64_t		ino_dir_size;
 	int			i;
 
-	sfp = (xfs_dir2_sf_t *)XFS_DFORK_DPTR(dip);
+	sfp = (struct xfs_dir2_sf_hdr *)XFS_DFORK_DPTR(dip);
 	ino_dir_size = be64_to_cpu(dip->di_size);
 	if (ino_dir_size > XFS_DFORK_DSIZE(dip, mp)) {
 		ino_dir_size = XFS_DFORK_DSIZE(dip, mp);
@@ -917,7 +978,7 @@ obfuscate_sf_dir(
 	}
 
 	sfep = xfs_dir2_sf_firstentry(sfp);
-	for (i = 0; (i < sfp->hdr.count) &&
+	for (i = 0; (i < sfp->count) &&
 			((char *)sfep - (char *)sfp < ino_dir_size); i++) {
 
 		/*
@@ -930,28 +991,70 @@ obfuscate_sf_dir(
 			if (show_warnings)
 				print_warning("zero length entry in dir inode "
 						"%llu", (long long)cur_ino);
-			if (i != sfp->hdr.count - 1)
+			if (i != sfp->count - 1)
 				break;
 			namelen = ino_dir_size - ((char *)&sfep->name[0] -
 					 (char *)sfp);
 		} else if ((char *)sfep - (char *)sfp +
-				xfs_dir2_sf_entsize_byentry(sfp, sfep) >
+				xfs_dir3_sf_entsize(mp, sfp, sfep->namelen) >
 				ino_dir_size) {
 			if (show_warnings)
 				print_warning("entry length in dir inode %llu "
 					"overflows space", (long long)cur_ino);
-			if (i != sfp->hdr.count - 1)
+			if (i != sfp->count - 1)
 				break;
 			namelen = ino_dir_size - ((char *)&sfep->name[0] -
 					 (char *)sfp);
 		}
 
-		generate_obfuscated_name(xfs_dir2_sf_get_inumber(sfp,
-				xfs_dir2_sf_inumberp(sfep)), namelen,
-				&sfep->name[0]);
+		generate_obfuscated_name(xfs_dir3_sfe_get_ino(mp, sfp, sfep),
+					 namelen, &sfep->name[0]);
 
 		sfep = (xfs_dir2_sf_entry_t *)((char *)sfep +
-				xfs_dir2_sf_entsize_byname(sfp, namelen));
+				xfs_dir3_sf_entsize(mp, sfp, namelen));
+	}
+}
+
+/*
+ * The pathname may not be null terminated. It may be terminated by the end of
+ * a buffer or inode literal area, and the start of the next region contains
+ * unknown data. Therefore, when we get to the last component of the symlink, we
+ * cannot assume that strlen() will give us the right result. Hence we need to
+ * track the remaining pathname length and use that instead.
+ */
+static void
+obfuscate_path_components(
+	char			*buf,
+	__uint64_t		len)
+{
+	uchar_t			*comp = (uchar_t *)buf;
+	uchar_t			*end = comp + len;
+	xfs_dahash_t		hash;
+
+	while (comp < end) {
+		char	*slash;
+		int	namelen;
+
+		/* find slash at end of this component */
+		slash = strchr((char *)comp, '/');
+		if (!slash) {
+			/* last (or single) component */
+			namelen = strnlen((char *)comp, len);
+			hash = libxfs_da_hashname(comp, namelen);
+			obfuscate_name(hash, namelen, comp);
+			break;
+		}
+		namelen = slash - (char *)comp;
+		/* handle leading or consecutive slashes */
+		if (!namelen) {
+			comp++;
+			len--;
+			continue;
+		}
+		hash = libxfs_da_hashname(comp, namelen);
+		obfuscate_name(hash, namelen, comp);
+		comp += namelen + 1;
+		len -= namelen + 1;
 	}
 }
 
@@ -971,8 +1074,7 @@ obfuscate_sf_symlink(
 	}
 
 	buf = (char *)XFS_DFORK_DPTR(dip);
-	while (len > 0)
-		buf[--len] = random() % 127 + 1;
+	obfuscate_path_components(buf, len);
 }
 
 static void
@@ -1028,24 +1130,11 @@ obfuscate_sf_attr(
 	}
 }
 
-/*
- * dir_data structure is used to track multi-fsblock dir2 blocks between extent
- * processing calls.
- */
-
-static struct dir_data_s {
-	int			end_of_data;
-	int			block_index;
-	int			offset_to_entry;
-	int			bad_block;
-} dir_data;
-
 static void
-obfuscate_dir_data_blocks(
-	char			*block,
-	xfs_dfiloff_t		offset,
-	xfs_dfilblks_t		count,
-	int			is_block_format)
+obfuscate_dir_data_block(
+	char		*block,
+	xfs_dfiloff_t	offset,
+	int		is_block_format)
 {
 	/*
 	 * we have to rely on the fileoffset and signature of the block to
@@ -1053,134 +1142,105 @@ obfuscate_dir_data_blocks(
 	 * for multi-fsblock dir blocks, if a name crosses an extent boundary,
 	 * ignore it and continue.
 	 */
-	int			c;
-	int			dir_offset;
-	char			*ptr;
-	char			*endptr;
+	int		dir_offset;
+	char		*ptr;
+	char		*endptr;
+	int		end_of_data;
+	int		wantmagic;
+	struct xfs_dir2_data_hdr *datahdr;
 
-	if (is_block_format && count != mp->m_dirblkfsbs)
-		return; /* too complex to handle this rare case */
+	datahdr = (struct xfs_dir2_data_hdr *)block;
 
-	for (c = 0, endptr = block; c < count; c++) {
+	if (offset % mp->m_dirblkfsbs != 0)
+		return;	/* corrupted, leave it alone */
 
-		if (dir_data.block_index == 0) {
-			int		wantmagic;
+	if (is_block_format) {
+		xfs_dir2_leaf_entry_t	*blp;
+		xfs_dir2_block_tail_t	*btp;
 
-			if (offset % mp->m_dirblkfsbs != 0)
-				return;	/* corrupted, leave it alone */
+		btp = xfs_dir2_block_tail_p(mp, datahdr);
+		blp = xfs_dir2_block_leaf_p(btp);
+		if ((char *)blp > (char *)btp)
+			blp = (xfs_dir2_leaf_entry_t *)btp;
 
-			dir_data.bad_block = 0;
+		end_of_data = (char *)blp - block;
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			wantmagic = XFS_DIR3_BLOCK_MAGIC;
+		else
+			wantmagic = XFS_DIR2_BLOCK_MAGIC;
+	} else { /* leaf/node format */
+		end_of_data = mp->m_dirblkfsbs << mp->m_sb.sb_blocklog;
+		if (xfs_sb_version_hascrc(&mp->m_sb))
+			wantmagic = XFS_DIR3_DATA_MAGIC;
+		else
+			wantmagic = XFS_DIR2_DATA_MAGIC;
+	}
 
-			if (is_block_format) {
-				xfs_dir2_leaf_entry_t	*blp;
-				xfs_dir2_block_tail_t	*btp;
+	if (be32_to_cpu(datahdr->magic) != wantmagic) {
+		if (show_warnings)
+			print_warning(
+		"invalid magic in dir inode %llu block %ld",
+					(long long)cur_ino, (long)offset);
+		return;
+	}
 
-				btp = xfs_dir2_block_tail_p(mp,
-						(xfs_dir2_block_t *)block);
-				blp = xfs_dir2_block_leaf_p(btp);
-				if ((char *)blp > (char *)btp)
-					blp = (xfs_dir2_leaf_entry_t *)btp;
+	dir_offset = xfs_dir3_data_entry_offset(datahdr);
+	ptr = block + dir_offset;
+	endptr = block + mp->m_sb.sb_blocksize;
 
-				dir_data.end_of_data = (char *)blp - block;
-				wantmagic = XFS_DIR2_BLOCK_MAGIC;
-			} else { /* leaf/node format */
-				dir_data.end_of_data = mp->m_dirblkfsbs <<
-						mp->m_sb.sb_blocklog;
-				wantmagic = XFS_DIR2_DATA_MAGIC;
-			}
-			dir_data.offset_to_entry = offsetof(xfs_dir2_data_t, u);
+	while (ptr < endptr && dir_offset < end_of_data) {
+		xfs_dir2_data_entry_t	*dep;
+		xfs_dir2_data_unused_t	*dup;
+		int			length;
 
-			if (be32_to_cpu(((xfs_dir2_data_hdr_t*)block)->magic) !=
-					wantmagic) {
+		dup = (xfs_dir2_data_unused_t *)ptr;
+
+		if (be16_to_cpu(dup->freetag) == XFS_DIR2_DATA_FREE_TAG) {
+			int	length = be16_to_cpu(dup->length);
+			if (dir_offset + length > end_of_data ||
+			    !length || (length & (XFS_DIR2_DATA_ALIGN - 1))) {
 				if (show_warnings)
-					print_warning("invalid magic in dir "
-						"inode %llu block %ld",
-						(long long)cur_ino,
-						(long)offset);
-				dir_data.bad_block = 1;
-			}
-		}
-		dir_data.block_index++;
-		if (dir_data.block_index == mp->m_dirblkfsbs)
-			dir_data.block_index = 0;
-
-		if (dir_data.bad_block)
-			continue;
-
-		dir_offset = (dir_data.block_index << mp->m_sb.sb_blocklog) +
-				dir_data.offset_to_entry;
-
-		ptr = endptr + dir_data.offset_to_entry;
-		endptr += mp->m_sb.sb_blocksize;
-
-		while (ptr < endptr && dir_offset < dir_data.end_of_data) {
-			xfs_dir2_data_entry_t	*dep;
-			xfs_dir2_data_unused_t	*dup;
-			int			length;
-
-			dup = (xfs_dir2_data_unused_t *)ptr;
-
-			if (be16_to_cpu(dup->freetag) == XFS_DIR2_DATA_FREE_TAG) {
-				int	length = be16_to_cpu(dup->length);
-				if (dir_offset + length > dir_data.end_of_data ||
-						length == 0 || (length &
-						 (XFS_DIR2_DATA_ALIGN - 1))) {
-					if (show_warnings)
-						print_warning("invalid length "
-							"for dir free space in "
-							"inode %llu",
-							(long long)cur_ino);
-					dir_data.bad_block = 1;
-					break;
-				}
-				if (be16_to_cpu(*xfs_dir2_data_unused_tag_p(dup)) !=
-						dir_offset) {
-					dir_data.bad_block = 1;
-					break;
-				}
-				dir_offset += length;
-				ptr += length;
-				if (dir_offset >= dir_data.end_of_data ||
-						ptr >= endptr)
-					break;
-			}
-
-			dep = (xfs_dir2_data_entry_t *)ptr;
-			length = xfs_dir2_data_entsize(dep->namelen);
-
-			if (dir_offset + length > dir_data.end_of_data ||
-					ptr + length > endptr) {
-				if (show_warnings)
-					print_warning("invalid length for "
-						"dir entry name in inode %llu",
+					print_warning(
+			"invalid length for dir free space in inode %llu",
 						(long long)cur_ino);
-				break;
+				return;
 			}
-			if (be16_to_cpu(*xfs_dir2_data_entry_tag_p(dep)) !=
-					dir_offset) {
-				dir_data.bad_block = 1;
-				break;
-			}
-			generate_obfuscated_name(be64_to_cpu(dep->inumber),
-					dep->namelen, &dep->name[0]);
+			if (be16_to_cpu(*xfs_dir2_data_unused_tag_p(dup)) !=
+					dir_offset)
+				return;
 			dir_offset += length;
 			ptr += length;
+			if (dir_offset >= end_of_data || ptr >= endptr)
+				return;
 		}
-		dir_data.offset_to_entry = dir_offset &
-						(mp->m_sb.sb_blocksize - 1);
+
+		dep = (xfs_dir2_data_entry_t *)ptr;
+		length = xfs_dir3_data_entsize(mp, dep->namelen);
+
+		if (dir_offset + length > end_of_data ||
+		    ptr + length > endptr) {
+			if (show_warnings)
+				print_warning(
+			"invalid length for dir entry name in inode %llu",
+					(long long)cur_ino);
+			return;
+		}
+		if (be16_to_cpu(*xfs_dir3_data_entry_tag_p(mp, dep)) !=
+				dir_offset)
+			return;
+		generate_obfuscated_name(be64_to_cpu(dep->inumber),
+					 dep->namelen, &dep->name[0]);
+		dir_offset += length;
+		ptr += length;
 	}
 }
 
 static void
-obfuscate_symlink_blocks(
-	char			*block,
-	xfs_dfilblks_t		count)
+obfuscate_symlink_block(
+	char			*block)
 {
-	int 			i;
-
-	count <<= mp->m_sb.sb_blocklog;
-	for (i = 0; i < count; i++)
-		block[i] = random() % 127 + 1;
+	/* XXX: need to handle CRC headers */
+	obfuscate_path_components(block, mp->m_sb.sb_blocksize);
 }
 
 #define MAX_REMOTE_VALS		4095
@@ -1201,86 +1261,227 @@ add_remote_vals(
 		blockidx++;
 		length -= XFS_LBSIZE(mp);
 	}
+
+	if (attr_data.remote_val_count >= MAX_REMOTE_VALS) {
+		print_warning(
+"Overflowed attr obfuscation array. No longer obfuscating remote attrs.");
+	}
 }
 
 static void
-obfuscate_attr_blocks(
+obfuscate_attr_block(
 	char			*block,
-	xfs_dfiloff_t		offset,
-	xfs_dfilblks_t		count)
+	xfs_dfiloff_t		offset)
 {
 	xfs_attr_leafblock_t	*leaf;
-	int			c;
 	int			i;
 	int			nentries;
 	xfs_attr_leaf_entry_t 	*entry;
 	xfs_attr_leaf_name_local_t *local;
 	xfs_attr_leaf_name_remote_t *remote;
 
-	for (c = 0; c < count; c++, offset++, block += XFS_LBSIZE(mp)) {
+	leaf = (xfs_attr_leafblock_t *)block;
 
-		leaf = (xfs_attr_leafblock_t *)block;
-
-		if (be16_to_cpu(leaf->hdr.info.magic) != XFS_ATTR_LEAF_MAGIC) {
-			for (i = 0; i < attr_data.remote_val_count; i++) {
-				if (attr_data.remote_vals[i] == offset)
-					memset(block, 0, XFS_LBSIZE(mp));
-			}
-			continue;
+	if (be16_to_cpu(leaf->hdr.info.magic) != XFS_ATTR_LEAF_MAGIC) {
+		for (i = 0; i < attr_data.remote_val_count; i++) {
+			/* XXX: need to handle CRC headers */
+			if (attr_data.remote_vals[i] == offset)
+				memset(block, 0, XFS_LBSIZE(mp));
 		}
+		return;
+	}
 
-		nentries = be16_to_cpu(leaf->hdr.count);
-		if (nentries * sizeof(xfs_attr_leaf_entry_t) +
-				sizeof(xfs_attr_leaf_hdr_t) > XFS_LBSIZE(mp)) {
+	nentries = be16_to_cpu(leaf->hdr.count);
+	if (nentries * sizeof(xfs_attr_leaf_entry_t) +
+			sizeof(xfs_attr_leaf_hdr_t) > XFS_LBSIZE(mp)) {
+		if (show_warnings)
+			print_warning("invalid attr count in inode %llu",
+					(long long)cur_ino);
+		return;
+	}
+
+	for (i = 0, entry = &leaf->entries[0]; i < nentries; i++, entry++) {
+		if (be16_to_cpu(entry->nameidx) > XFS_LBSIZE(mp)) {
 			if (show_warnings)
-				print_warning("invalid attr count in inode %llu",
+				print_warning(
+				"invalid attr nameidx in inode %llu",
 						(long long)cur_ino);
-			continue;
+			break;
 		}
-
-		for (i = 0, entry = &leaf->entries[0]; i < nentries;
-				i++, entry++) {
-			if (be16_to_cpu(entry->nameidx) > XFS_LBSIZE(mp)) {
+		if (entry->flags & XFS_ATTR_LOCAL) {
+			local = xfs_attr3_leaf_name_local(leaf, i);
+			if (local->namelen == 0) {
 				if (show_warnings)
-					print_warning("invalid attr nameidx "
-							"in inode %llu",
-							(long long)cur_ino);
+					print_warning(
+				"zero length for attr name in inode %llu",
+						(long long)cur_ino);
 				break;
 			}
-			if (entry->flags & XFS_ATTR_LOCAL) {
-				local = xfs_attr_leaf_name_local(leaf, i);
-				if (local->namelen == 0) {
-					if (show_warnings)
-						print_warning("zero length for "
-							"attr name in inode %llu",
-							(long long)cur_ino);
-					break;
-				}
-				generate_obfuscated_name(0, local->namelen,
-					&local->nameval[0]);
-				memset(&local->nameval[local->namelen], 0,
-					be16_to_cpu(local->valuelen));
-			} else {
-				remote = xfs_attr_leaf_name_remote(leaf, i);
-				if (remote->namelen == 0 ||
-						remote->valueblk == 0) {
-					if (show_warnings)
-						print_warning("invalid attr "
-							"entry in inode %llu",
-							(long long)cur_ino);
-					break;
-				}
-				generate_obfuscated_name(0, remote->namelen,
-					&remote->name[0]);
-				add_remote_vals(be32_to_cpu(remote->valueblk),
-					be32_to_cpu(remote->valuelen));
+			generate_obfuscated_name(0, local->namelen,
+				&local->nameval[0]);
+			memset(&local->nameval[local->namelen], 0,
+				be16_to_cpu(local->valuelen));
+		} else {
+			remote = xfs_attr3_leaf_name_remote(leaf, i);
+			if (remote->namelen == 0 || remote->valueblk == 0) {
+				if (show_warnings)
+					print_warning(
+				"invalid attr entry in inode %llu",
+						(long long)cur_ino);
+				break;
 			}
+			generate_obfuscated_name(0, remote->namelen,
+						 &remote->name[0]);
+			add_remote_vals(be32_to_cpu(remote->valueblk),
+					be32_to_cpu(remote->valuelen));
 		}
 	}
 }
 
-/* inode copy routines */
+static int
+process_single_fsb_objects(
+	xfs_dfiloff_t	o,
+	xfs_dfsbno_t	s,
+	xfs_dfilblks_t	c,
+	typnm_t		btype,
+	xfs_dfiloff_t	last)
+{
+	char		*dp;
+	int		ret = 0;
+	int		i;
 
+	for (i = 0; i < c; i++) {
+		push_cur();
+		set_cur(&typtab[btype], XFS_FSB_TO_DADDR(mp, s), blkbb,
+				DB_RING_IGN, NULL);
+
+		if (!iocur_top->data) {
+			xfs_agnumber_t	agno = XFS_FSB_TO_AGNO(mp, s);
+			xfs_agblock_t	agbno = XFS_FSB_TO_AGBNO(mp, s);
+
+			print_warning("cannot read %s block %u/%u (%llu)",
+					typtab[btype].name, agno, agbno, s);
+			if (stop_on_read_error)
+				ret = -EIO;
+			goto out_pop;
+
+		}
+
+		if (dont_obfuscate)
+			goto write;
+
+		dp = iocur_top->data;
+		switch (btype) {
+		case TYP_DIR2:
+			if (o >= mp->m_dirleafblk)
+				break;
+
+			obfuscate_dir_data_block(dp, o,
+						 last == mp->m_dirblkfsbs);
+			iocur_top->need_crc = 1;
+			break;
+		case TYP_SYMLINK:
+			obfuscate_symlink_block(dp);
+			iocur_top->need_crc = 1;
+			break;
+		case TYP_ATTR:
+			obfuscate_attr_block(dp, o);
+			iocur_top->need_crc = 1;
+			break;
+		default:
+			break;
+		}
+
+write:
+		ret = write_buf(iocur_top);
+out_pop:
+		pop_cur();
+		if (ret)
+			break;
+		o++;
+		s++;
+	}
+
+	return ret;
+}
+
+/*
+ * Static map to aggregate multiple extents into a single directory block.
+ */
+static struct bbmap mfsb_map;
+static int mfsb_length;
+
+static int
+process_multi_fsb_objects(
+	xfs_dfiloff_t	o,
+	xfs_dfsbno_t	s,
+	xfs_dfilblks_t	c,
+	typnm_t		btype,
+	xfs_dfiloff_t	last)
+{
+	int		ret = 0;
+
+	switch (btype) {
+	case TYP_DIR2:
+		break;
+	default:
+		print_warning("bad type for multi-fsb object %d", btype);
+		return -EINVAL;
+	}
+
+	while (c > 0) {
+		unsigned int	bm_len;
+
+		if (mfsb_length + c >= mp->m_dirblkfsbs) {
+			bm_len = mp->m_dirblkfsbs - mfsb_length;
+			mfsb_length = 0;
+		} else {
+			mfsb_length += c;
+			bm_len = c;
+		}
+
+		mfsb_map.b[mfsb_map.nmaps].bm_bn = XFS_FSB_TO_DADDR(mp, s);
+		mfsb_map.b[mfsb_map.nmaps].bm_len = XFS_FSB_TO_BB(mp, bm_len);
+		mfsb_map.nmaps++;
+
+		if (mfsb_length == 0) {
+			push_cur();
+			set_cur(&typtab[btype], 0, 0, DB_RING_IGN, &mfsb_map);
+			if (!iocur_top->data) {
+				xfs_agnumber_t	agno = XFS_FSB_TO_AGNO(mp, s);
+				xfs_agblock_t	agbno = XFS_FSB_TO_AGBNO(mp, s);
+
+				print_warning("cannot read %s block %u/%u (%llu)",
+						typtab[btype].name, agno, agbno, s);
+				if (stop_on_read_error)
+					ret = -1;
+				goto out_pop;
+
+			}
+
+			if (dont_obfuscate || o >= mp->m_dirleafblk) {
+				ret = write_buf(iocur_top);
+				goto out_pop;
+			}
+
+			obfuscate_dir_data_block(iocur_top->data, o,
+						  last == mp->m_dirblkfsbs);
+			iocur_top->need_crc = 1;
+			ret = write_buf(iocur_top);
+out_pop:
+			pop_cur();
+			mfsb_map.nmaps = 0;
+			if (ret)
+				break;
+		}
+		c -= bm_len;
+		s += bm_len;
+	}
+
+	return ret;
+}
+
+/* inode copy routines */
 static int
 process_bmbt_reclist(
 	xfs_bmbt_rec_t 		*rp,
@@ -1295,6 +1496,7 @@ process_bmbt_reclist(
 	xfs_dfiloff_t		last;
 	xfs_agnumber_t		agno;
 	xfs_agblock_t		agbno;
+	int			error;
 
 	if (btype == TYP_DATA)
 		return 1;
@@ -1356,44 +1558,14 @@ process_bmbt_reclist(
 			break;
 		}
 
-		push_cur();
-		set_cur(&typtab[btype], XFS_FSB_TO_DADDR(mp, s), c * blkbb,
-				DB_RING_IGN, NULL);
-		if (iocur_top->data == NULL) {
-			print_warning("cannot read %s block %u/%u (%llu)",
-					typtab[btype].name, agno, agbno, s);
-			if (stop_on_read_error) {
-				pop_cur();
-				return 0;
-			}
+		/* multi-extent blocks require special handling */
+		if (btype != TYP_DIR2 || mp->m_dirblkfsbs == 1) {
+			error = process_single_fsb_objects(o, s, c, btype, last);
 		} else {
-			if (!dont_obfuscate)
-			    switch (btype) {
-				case TYP_DIR2:
-					if (o < mp->m_dirleafblk)
-						obfuscate_dir_data_blocks(
-							iocur_top->data, o, c,
-							last == mp->m_dirblkfsbs);
-					break;
-
-				case TYP_SYMLINK:
-					obfuscate_symlink_blocks(
-						iocur_top->data, c);
-					break;
-
-				case TYP_ATTR:
-					obfuscate_attr_blocks(iocur_top->data,
-						o, c);
-					break;
-
-				default: ;
-			    }
-			if (!write_buf(iocur_top)) {
-				pop_cur();
-				return 0;
-			}
+			error = process_multi_fsb_objects(o, s, c, btype, last);
 		}
-		pop_cur();
+		if (error)
+			return 0;
 	}
 
 	return 1;
@@ -1575,6 +1747,13 @@ process_inode_data(
 	return 1;
 }
 
+/*
+ * when we process the inode, we may change the data in the data and/or
+ * attribute fork if they are in short form and we are obfuscating names.
+ * In this case we need to recalculate the CRC of the inode, but we should
+ * only do that if the CRC in the inode is good to begin with. If the crc
+ * is not ok, we just leave it alone.
+ */
 static int
 process_inode(
 	xfs_agnumber_t		agno,
@@ -1582,18 +1761,30 @@ process_inode(
 	xfs_dinode_t 		*dip)
 {
 	int			success;
+	bool			crc_was_ok = false; /* no recalc by default */
+	bool			need_new_crc = false;
 
 	success = 1;
 	cur_ino = XFS_AGINO_TO_INO(mp, agno, agino);
 
+	/* we only care about crc recalculation if we are obfuscating names. */
+	if (!dont_obfuscate) {
+		crc_was_ok = xfs_verify_cksum((char *)dip,
+					mp->m_sb.sb_inodesize,
+					offsetof(struct xfs_dinode, di_crc));
+	}
+
 	/* copy appropriate data fork metadata */
 	switch (be16_to_cpu(dip->di_mode) & S_IFMT) {
 		case S_IFDIR:
-			memset(&dir_data, 0, sizeof(dir_data));
 			success = process_inode_data(dip, TYP_DIR2);
+			if (dip->di_format == XFS_DINODE_FMT_LOCAL)
+				need_new_crc = 1;
 			break;
 		case S_IFLNK:
 			success = process_inode_data(dip, TYP_SYMLINK);
+			if (dip->di_format == XFS_DINODE_FMT_LOCAL)
+				need_new_crc = 1;
 			break;
 		case S_IFREG:
 			success = process_inode_data(dip, TYP_DATA);
@@ -1603,10 +1794,12 @@ process_inode(
 	nametable_clear();
 
 	/* copy extended attributes if they exist and forkoff is valid */
-	if (success && XFS_DFORK_DSIZE(dip, mp) < XFS_LITINO(mp)) {
+	if (success &&
+	    XFS_DFORK_DSIZE(dip, mp) < XFS_LITINO(mp, dip->di_version)) {
 		attr_data.remote_val_count = 0;
 		switch (dip->di_aformat) {
 			case XFS_DINODE_FMT_LOCAL:
+				need_new_crc = 1;
 				if (!dont_obfuscate)
 					obfuscate_sf_attr(dip);
 				break;
@@ -1621,6 +1814,9 @@ process_inode(
 		}
 		nametable_clear();
 	}
+
+	if (crc_was_ok && need_new_crc)
+		xfs_dinode_calc_crc(mp, dip);
 	return success;
 }
 
@@ -1693,7 +1889,7 @@ copy_inode_chunk(
 			goto pop_out;
 	}
 skip_processing:
-	if (!write_buf(iocur_top))
+	if (write_buf(iocur_top))
 		goto pop_out;
 
 	inodes_copied += XFS_INODES_PER_CHUNK;
@@ -1721,6 +1917,7 @@ scanfunc_ino(
 	xfs_inobt_ptr_t		*pp;
 	int			i;
 	int			numrecs;
+	int			finobt = *(int *) arg;
 
 	numrecs = be16_to_cpu(block->bb_numrecs);
 
@@ -1732,6 +1929,14 @@ scanfunc_ino(
 					typtab[btype].name, agno, agbno);
 			numrecs = mp->m_inobt_mxr[0];
 		}
+
+		/*
+		 * Only copy the btree blocks for the finobt. The inobt scan
+		 * copies the inode chunks.
+		 */
+		if (finobt)
+			return 1;
+
 		rp = XFS_INOBT_REC_ADDR(mp, block, 1);
 		for (i = 0; i < numrecs; i++, rp++) {
 			if (!copy_inode_chunk(agno, rp))
@@ -1771,6 +1976,7 @@ copy_inodes(
 {
 	xfs_agblock_t		root;
 	int			levels;
+	int			finobt = 0;
 
 	root = be32_to_cpu(agi->agi_root);
 	levels = be32_to_cpu(agi->agi_level);
@@ -1789,7 +1995,20 @@ copy_inodes(
 		return 1;
 	}
 
-	return scan_btree(agno, root, levels, TYP_INOBT, agi, scanfunc_ino);
+	if (!scan_btree(agno, root, levels, TYP_INOBT, &finobt, scanfunc_ino))
+		return 0;
+
+	if (xfs_sb_version_hasfinobt(&mp->m_sb)) {
+		root = be32_to_cpu(agi->agi_free_root);
+		levels = be32_to_cpu(agi->agi_free_level);
+
+		finobt = 1;
+		if (!scan_btree(agno, root, levels, TYP_INOBT, &finobt,
+				scanfunc_ino))
+			return 0;
+	}
+
+	return 1;
 }
 
 static int
@@ -1811,7 +2030,7 @@ scan_ag(
 		if (stop_on_read_error)
 			goto pop_out;
 	} else {
-		if (!write_buf(iocur_top))
+		if (write_buf(iocur_top))
 			goto pop_out;
 	}
 
@@ -1826,7 +2045,7 @@ scan_ag(
 		if (stop_on_read_error)
 			goto pop_out;
 	} else {
-		if (!write_buf(iocur_top))
+		if (write_buf(iocur_top))
 			goto pop_out;
 	}
 
@@ -1841,7 +2060,7 @@ scan_ag(
 		if (stop_on_read_error)
 			goto pop_out;
 	} else {
-		if (!write_buf(iocur_top))
+		if (write_buf(iocur_top))
 			goto pop_out;
 	}
 
@@ -1855,7 +2074,7 @@ scan_ag(
 		if (stop_on_read_error)
 			goto pop_out;
 	} else {
-		if (!write_buf(iocur_top))
+		if (write_buf(iocur_top))
 			goto pop_out;
 	}
 
@@ -1940,7 +2159,10 @@ copy_sb_inodes(void)
 	if (!copy_ino(mp->m_sb.sb_uquotino, TYP_DQBLK))
 		return 0;
 
-	return copy_ino(mp->m_sb.sb_gquotino, TYP_DQBLK);
+	if (!copy_ino(mp->m_sb.sb_gquotino, TYP_DQBLK))
+		return 0;
+
+	return copy_ino(mp->m_sb.sb_pquotino, TYP_DQBLK);
 }
 
 static int
@@ -1957,7 +2179,7 @@ copy_log(void)
 		print_warning("cannot read log");
 		return !stop_on_read_error;
 	}
-	return write_buf(iocur_top);
+	return !write_buf(iocur_top);
 }
 
 static int
@@ -2063,7 +2285,7 @@ metadump_f(
 
 	/* write the remaining index */
 	if (!exitcode)
-		exitcode = !write_index();
+		exitcode = write_index() < 0;
 
 	if (progress_since_warning)
 		fputc('\n', (outf == stdout) ? stderr : stdout);

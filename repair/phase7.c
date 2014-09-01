@@ -40,19 +40,20 @@ set_nlinks(
 
 	if (!no_modify) {
 		*dirty = 1;
-		do_warn(_("resetting inode %" PRIu64 " nlinks from %d to %d\n"),
+		do_warn(_("resetting inode %" PRIu64 " nlinks from %u to %u\n"),
 			ino, dinoc->di_nlink, nrefs);
 
-		if (nrefs > XFS_MAXLINK_1)  {
+		if (dinoc->di_version == 1 && nrefs > XFS_MAXLINK_1)  {
 			ASSERT(fs_inode_nlink);
 			do_warn(
-_("nlinks %d will overflow v1 ino, ino %" PRIu64 " will be converted to version 2\n"),
+_("nlinks %u will overflow v1 ino, ino %" PRIu64 " will be converted to version 2\n"),
 				nrefs, ino);
 
 		}
 		dinoc->di_nlink = nrefs;
 	} else  {
-		do_warn(_("would have reset inode %" PRIu64 " nlinks from %d to %d\n"),
+		do_warn(
+_("would have reset inode %" PRIu64 " nlinks from %u to %u\n"),
 			ino, dinoc->di_nlink, nrefs);
 	}
 }
@@ -67,13 +68,12 @@ update_inode_nlinks(
 	xfs_inode_t		*ip;
 	int			error;
 	int			dirty;
+	int			nres;
 
 	tp = libxfs_trans_alloc(mp, XFS_TRANS_REMOVE);
 
-	error = libxfs_trans_reserve(tp, (no_modify ? 0 : 10),
-			XFS_REMOVE_LOG_RES(mp), 0, XFS_TRANS_PERM_LOG_RES,
-			XFS_REMOVE_LOG_COUNT);
-
+	nres = no_modify ? 0 : 10;
+	error = libxfs_trans_reserve(tp, &M_RES(mp)->tr_remove, nres, 0);
 	ASSERT(error == 0);
 
 	error = libxfs_trans_iget(mp, tp, ino, 0, 0, &ip);
@@ -99,7 +99,6 @@ update_inode_nlinks(
 	set_nlinks(&ip->i_d, ino, nlinks, &dirty);
 
 	if (!dirty)  {
-		libxfs_trans_iput(tp, ip, 0);
 		libxfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES);
 	} else  {
 		libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
@@ -113,6 +112,7 @@ update_inode_nlinks(
 
 		ASSERT(error == 0);
 	}
+	IRELE(ip);
 }
 
 void
@@ -143,10 +143,9 @@ phase7(xfs_mount_t *mp)
 					continue;
 
 				ASSERT(no_modify || is_inode_reached(irec, j));
-				ASSERT(no_modify ||
-						is_inode_referenced(irec, j));
 
 				nrefs = num_inode_references(irec, j);
+				ASSERT(no_modify || nrefs > 0);
 
 				if (get_inode_disk_nlinks(irec, j) != nrefs)
 					update_inode_nlinks(mp,

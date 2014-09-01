@@ -108,7 +108,19 @@ const field_t	sb_flds[] = {
 	{ "logsectsize", FLDT_UINT16D, OI(OFF(logsectsize)), C1, 0, TYP_NONE },
 	{ "logsunit", FLDT_UINT32D, OI(OFF(logsunit)), C1, 0, TYP_NONE },
 	{ "features2", FLDT_UINT32X, OI(OFF(features2)), C1, 0, TYP_NONE },
-	{ "bad_features2", FLDT_UINT32X, OI(OFF(bad_features2)), C1, 0, TYP_NONE },
+	{ "bad_features2", FLDT_UINT32X, OI(OFF(bad_features2)),
+		C1, 0, TYP_NONE },
+	{ "features_compat", FLDT_UINT32X, OI(OFF(features_compat)),
+		C1, 0, TYP_NONE },
+	{ "features_ro_compat", FLDT_UINT32X, OI(OFF(features_ro_compat)),
+		C1, 0, TYP_NONE },
+	{ "features_incompat", FLDT_UINT32X, OI(OFF(features_incompat)),
+		C1, 0, TYP_NONE },
+	{ "features_log_incompat", FLDT_UINT32X, OI(OFF(features_log_incompat)),
+		C1, 0, TYP_NONE },
+	{ "crc", FLDT_CRC, OI(OFF(crc)), C1, 0, TYP_NONE },
+	{ "pquotino", FLDT_INO, OI(OFF(pquotino)), C1, 0, TYP_INODE },
+	{ "lsn", FLDT_UINT64X, OI(OFF(lsn)), C1, 0, TYP_NONE },
 	{ NULL }
 };
 
@@ -205,12 +217,15 @@ get_sb(xfs_agnumber_t agno, xfs_sb_t *sb)
 }
 
 /* workaround craziness in the xlog routines */
-int xlog_recover_do_trans(xlog_t *log, xlog_recover_t *t, int p) { return 0; }
+int xlog_recover_do_trans(struct xlog *log, xlog_recover_t *t, int p)
+{
+	return 0;
+}
 
 int
 sb_logcheck(void)
 {
-	xlog_t		log;
+	struct xlog	log;
 	xfs_daddr_t	head_blk, tail_blk;
 
 	if (mp->m_sb.sb_logstart) {
@@ -228,14 +243,18 @@ sb_logcheck(void)
 	}
 
 	memset(&log, 0, sizeof(log));
-	if (!x.logdev)
-		x.logdev = x.ddev;
+	libxfs_buftarg_init(mp, x.ddev, x.logdev, x.rtdev);
 	x.logBBsize = XFS_FSB_TO_BB(mp, mp->m_sb.sb_logblocks);
 	x.logBBstart = XFS_FSB_TO_DADDR(mp, mp->m_sb.sb_logstart);
-	log.l_dev = (mp->m_sb.sb_logstart == 0) ? x.logdev : x.ddev;
+	x.lbsize = BBSIZE;
+	if (xfs_sb_version_hassector(&mp->m_sb))
+		x.lbsize <<= (mp->m_sb.sb_logsectlog - BBSHIFT);
+
+	log.l_dev = mp->m_logdev_targp;
 	log.l_logsize = BBTOB(log.l_logBBsize);
 	log.l_logBBsize = x.logBBsize;
 	log.l_logBBstart = x.logBBstart;
+	log.l_sectBBsize  = BTOBB(x.lbsize);
 	log.l_mp = mp;
 
 	if (xlog_find_tail(&log, &head_blk, &tail_blk)) {
@@ -263,8 +282,7 @@ sb_logzero(uuid_t *uuidp)
 
 	dbprintf(_("Clearing log and setting UUID\n"));
 
-	if (libxfs_log_clear(
-			(mp->m_sb.sb_logstart == 0) ? x.logdev : x.ddev,
+	if (libxfs_log_clear(mp->m_logdev_targp,
 			XFS_FSB_TO_DADDR(mp, mp->m_sb.sb_logstart),
 			(xfs_extlen_t)XFS_FSB_TO_BB(mp, mp->m_sb.sb_logblocks),
 			uuidp,
@@ -591,6 +609,8 @@ version_string(
 		strcpy(s, "V3");
 	else if (XFS_SB_VERSION_NUM(sbp) == XFS_SB_VERSION_4)
 		strcpy(s, "V4");
+	else if (XFS_SB_VERSION_NUM(sbp) == XFS_SB_VERSION_5)
+		strcpy(s, "V5");
 
 	if (xfs_sb_version_hasattr(sbp))
 		strcat(s, ",ATTR");
@@ -622,9 +642,19 @@ version_string(
 		strcat(s, ",LAZYSBCOUNT");
 	if (xfs_sb_version_hasprojid32bit(sbp))
 		strcat(s, ",PROJID32BIT");
+	if (xfs_sb_version_hascrc(sbp))
+		strcat(s, ",CRC");
+	if (xfs_sb_version_hasftype(sbp))
+		strcat(s, ",FTYPE");
 	return s;
 }
 
+/*
+ * XXX: this only supports reading and writing to version 4 superblock fields.
+ * V5 superblocks always define certain V4 feature bits - they are blocked from
+ * being changed if a V5 sb is detected, but otherwise v5 superblock features
+ * are not handled here.
+ */
 static int
 version_f(
 	int		argc,
@@ -656,11 +686,15 @@ version_f(
 				break;
 			case XFS_SB_VERSION_4:
 				if (xfs_sb_version_hasextflgbit(&mp->m_sb))
-					dbprintf(_("unwritten extents flag"
-						 " is already enabled\n"));
+					dbprintf(
+		_("unwritten extents flag is already enabled\n"));
 				else
 					version = mp->m_sb.sb_versionnum |
 						  XFS_SB_VERSION_EXTFLGBIT;
+				break;
+			case XFS_SB_VERSION_5:
+				dbprintf(
+		_("unwritten extents always enabled for v5 superblocks.\n"));
 				break;
 			}
 		} else if (!strcasecmp(argv[1], "log2")) {
@@ -676,14 +710,24 @@ version_f(
 				break;
 			case XFS_SB_VERSION_4:
 				if (xfs_sb_version_haslogv2(&mp->m_sb))
-					dbprintf(_("version 2 log format"
-						 " is already in use\n"));
+					dbprintf(
+		_("version 2 log format is already in use\n"));
 				else
 					version = mp->m_sb.sb_versionnum |
 						  XFS_SB_VERSION_LOGV2BIT;
 				break;
+			case XFS_SB_VERSION_5:
+				dbprintf(
+		_("Version 2 logs always enabled for v5 superblocks.\n"));
+				break;
 			}
+		} else if (XFS_SB_VERSION_NUM(&mp->m_sb) == XFS_SB_VERSION_5) {
+			dbprintf(
+		_("%s: Cannot change %s on v5 superblocks.\n"),
+				progname, argv[1]);
+			return 0;
 		} else if (!strcasecmp(argv[1], "attr1")) {
+
 			if (xfs_sb_version_hasattr2(&mp->m_sb)) {
 				if (!(mp->m_sb.sb_features2 &=
 						~XFS_SB_VERSION2_ATTR2BIT))

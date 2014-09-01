@@ -97,6 +97,7 @@ path_to_fshandle(
 		/* new filesystem. add it to the cache */
 		fdhp = malloc(sizeof(struct fdhash));
 		if (fdhp == NULL) {
+			close(fd);
 			errno = ENOMEM;
 			return -1;
 		}
@@ -158,7 +159,8 @@ path_to_fspath(char *path)
 	if (S_ISREG(statbuf.st_mode) || S_ISDIR(statbuf.st_mode))
 		return path;
 
-	strcpy(dirpath, path);
+	strncpy(dirpath, path, MAXPATHLEN);
+	dirpath[MAXPATHLEN-1] = '\0';
 	return dirname(dirpath);
 }
 

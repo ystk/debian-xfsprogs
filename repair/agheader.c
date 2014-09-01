@@ -22,7 +22,12 @@
 #include "protos.h"
 #include "err_protos.h"
 
-int
+/*
+ * XXX (dgc): What is the point of all the check and repair here when phase 5
+ * recreates the AGF/AGI/AGFL completely from scratch?
+ */
+
+static int
 verify_set_agf(xfs_mount_t *mp, xfs_agf_t *agf, xfs_agnumber_t i)
 {
 	xfs_drfsbno_t agblocks;
@@ -104,10 +109,23 @@ verify_set_agf(xfs_mount_t *mp, xfs_agf_t *agf, xfs_agnumber_t i)
 
 	/* don't check freespace btrees -- will be checked by caller */
 
-	return(retval);
+	if (!xfs_sb_version_hascrc(&mp->m_sb))
+		return retval;
+
+	if (platform_uuid_compare(&agf->agf_uuid, &mp->m_sb.sb_uuid)) {
+		char uu[64];
+
+		retval = XR_AG_AGF;
+		platform_uuid_unparse(&agf->agf_uuid, uu);
+		do_warn(_("bad uuid %s for agf %d\n"), uu, i);
+
+		if (!no_modify)
+			platform_uuid_copy(&agf->agf_uuid, &mp->m_sb.sb_uuid);
+	}
+	return retval;
 }
 
-int
+static int
 verify_set_agi(xfs_mount_t *mp, xfs_agi_t *agi, xfs_agnumber_t agno)
 {
 	xfs_drfsbno_t agblocks;
@@ -169,7 +187,21 @@ verify_set_agi(xfs_mount_t *mp, xfs_agi_t *agi, xfs_agnumber_t agno)
 
 	/* don't check inode btree -- will be checked by caller */
 
-	return(retval);
+	if (!xfs_sb_version_hascrc(&mp->m_sb))
+		return retval;
+
+	if (platform_uuid_compare(&agi->agi_uuid, &mp->m_sb.sb_uuid)) {
+		char uu[64];
+
+		retval = XR_AG_AGI;
+		platform_uuid_unparse(&agi->agi_uuid, uu);
+		do_warn(_("bad uuid %s for agi %d\n"), uu, agno);
+
+		if (!no_modify)
+			platform_uuid_copy(&agi->agi_uuid, &mp->m_sb.sb_uuid);
+	}
+
+	return retval;
 }
 
 /*
@@ -177,14 +209,13 @@ verify_set_agi(xfs_mount_t *mp, xfs_agi_t *agi, xfs_agnumber_t agno)
  *			filesystem mount-point superblock
  *
  * the verified fields include id and geometry.
-
+ *
  * the inprogress fields, version numbers, and counters
  * are allowed to differ as well as all fields after the
  * counters to cope with the pre-6.5 mkfs non-zeroed
  * secondary superblock sectors.
  */
-
-int
+static int
 compare_sb(xfs_mount_t *mp, xfs_sb_t *sb)
 {
 	fs_geometry_t fs_geo, sb_geo;
@@ -213,71 +244,78 @@ compare_sb(xfs_mount_t *mp, xfs_sb_t *sb)
  * Note: contrary to the name, this routine is called for all
  * superblocks, not just the secondary superblocks.
  */
-int
-secondary_sb_wack(xfs_mount_t *mp, xfs_buf_t *sbuf, xfs_sb_t *sb,
-	xfs_agnumber_t i)
+static int
+secondary_sb_wack(
+	struct xfs_mount *mp,
+	struct xfs_buf	*sbuf,
+	struct xfs_sb	*sb,
+	xfs_agnumber_t	i)
 {
-	int do_bzero;
-	int size;
-	char *ip;
-	int rval;
+	struct xfs_dsb	*dsb = XFS_BUF_TO_SBP(sbuf);
+	int		do_bzero = 0;
+	int		size;
+	char		*ip;
+	int		rval = 0;;
 
 	rval = do_bzero = 0;
 
 	/*
-	 * mkfs's that stamped a feature bit besides the ones in the mask
-	 * (e.g. were pre-6.5 beta) could leave garbage in the secondary
-	 * superblock sectors.  Anything stamping the shared fs bit or better
-	 * into the secondaries is ok and should generate clean secondary
-	 * superblock sectors.  so only run the zero check on the
-	 * potentially garbaged secondaries.
+	 * Check for garbage beyond the last valid field.
+	 * Use field addresses instead so this code will still
+	 * work against older filesystems when the superblock
+	 * gets rev'ed again with new fields appended.
+	 *
+	 * size is the size of data which is valid for this sb.
 	 */
-	if (pre_65_beta ||
-	    (sb->sb_versionnum & XR_GOOD_SECSB_VNMASK) == 0 ||
-	    sb->sb_versionnum < XFS_SB_VERSION_4)  {
-		/*
-		 * Check for garbage beyond the last field.
-		 * Use field addresses instead so this code will still
-		 * work against older filesystems when the superblock
-		 * gets rev'ed again with new fields appended.
-		 */
-		if (xfs_sb_version_hasmorebits(sb))
-			size = (__psint_t)&sb->sb_features2
-				+ sizeof(sb->sb_features2) - (__psint_t)sb;
-		else if (xfs_sb_version_haslogv2(sb))
-			size = (__psint_t)&sb->sb_logsunit
-				+ sizeof(sb->sb_logsunit) - (__psint_t)sb;
-		else if (xfs_sb_version_hassector(sb))
-			size = (__psint_t)&sb->sb_logsectsize
-				+ sizeof(sb->sb_logsectsize) - (__psint_t)sb;
-		else if (xfs_sb_version_hasdirv2(sb))
-			size = (__psint_t)&sb->sb_dirblklog
-				+ sizeof(sb->sb_dirblklog) - (__psint_t)sb;
-		else
-			size = (__psint_t)&sb->sb_width
-				+ sizeof(sb->sb_width) - (__psint_t)sb;
-		for (ip = (char *)((__psint_t)sb + size);
-		     ip < (char *)((__psint_t)sb + mp->m_sb.sb_sectsize);
-		     ip++)  {
-			if (*ip)  {
-				do_bzero = 1;
-				break;
-			}
-		}
+	if (xfs_sb_version_hascrc(sb))
+		size = offsetof(xfs_sb_t, sb_lsn)
+			+ sizeof(sb->sb_lsn);
+	else if (xfs_sb_version_hasmorebits(sb))
+		size = offsetof(xfs_sb_t, sb_bad_features2)
+			+ sizeof(sb->sb_bad_features2);
+	else if (xfs_sb_version_haslogv2(sb))
+		size = offsetof(xfs_sb_t, sb_logsunit)
+			+ sizeof(sb->sb_logsunit);
+	else if (xfs_sb_version_hassector(sb))
+		size = offsetof(xfs_sb_t, sb_logsectsize)
+			+ sizeof(sb->sb_logsectsize);
+	else if (xfs_sb_version_hasdirv2(sb))
+		size = offsetof(xfs_sb_t, sb_dirblklog)
+			+ sizeof(sb->sb_dirblklog);
+	else
+		size = offsetof(xfs_sb_t, sb_width)
+			+ sizeof(sb->sb_width);
 
-		if (do_bzero)  {
-			rval |= XR_AG_SB_SEC;
-			if (!no_modify)  {
-				do_warn(
-		_("zeroing unused portion of %s superblock (AG #%u)\n"),
-					!i ? _("primary") : _("secondary"), i);
-				memset((void *)((__psint_t)sb + size), 0,
-					mp->m_sb.sb_sectsize - size);
-			} else
-				do_warn(
-		_("would zero unused portion of %s superblock (AG #%u)\n"),
-					!i ? _("primary") : _("secondary"), i);
+	/* Check the buffer we read from disk for garbage outside size */
+	for (ip = XFS_BUF_PTR(sbuf) + size;
+	     ip < XFS_BUF_PTR(sbuf) + mp->m_sb.sb_sectsize;
+	     ip++)  {
+		if (*ip)  {
+			do_bzero = 1;
+			break;
 		}
+	}
+	if (do_bzero)  {
+		rval |= XR_AG_SB_SEC;
+		if (!no_modify)  {
+			do_warn(
+	_("zeroing unused portion of %s superblock (AG #%u)\n"),
+				!i ? _("primary") : _("secondary"), i);
+			/*
+			 * zero both the in-memory sb and the disk buffer,
+			 * because the former was read from disk and
+			 * may contain newer version fields that shouldn't
+			 * be set, and the latter is never updated past
+			 * the last field - just zap them both.
+			 */
+			memset((void *)((__psint_t)sb + size), 0,
+				mp->m_sb.sb_sectsize - size);
+			memset(XFS_BUF_PTR(sbuf) + size, 0,
+				mp->m_sb.sb_sectsize - size);
+		} else
+			do_warn(
+	_("would zero unused portion of %s superblock (AG #%u)\n"),
+				!i ? _("primary") : _("secondary"), i);
 	}
 
 	/*
@@ -300,12 +338,18 @@ secondary_sb_wack(xfs_mount_t *mp, xfs_buf_t *sbuf, xfs_sb_t *sb,
 	}
 
 	/*
-	 * quota inodes and flags in secondary superblocks
-	 * are never set by mkfs.  However, they could be set
-	 * in a secondary if a fs with quotas was growfs'ed since
-	 * growfs copies the new primary into the secondaries.
+	 * quota inodes and flags in secondary superblocks are never set by
+	 * mkfs.  However, they could be set in a secondary if a fs with quotas
+	 * was growfs'ed since growfs copies the new primary into the
+	 * secondaries.
+	 *
+	 * Also, the in-core inode flags now have different meaning to the
+	 * on-disk flags, and so libxfs_sb_to_disk cannot directly write the
+	 * sb_gquotino/sb_pquotino fields without specific sb_qflags being set.
+	 * Hence we need to zero those fields directly in the sb buffer here.
 	 */
-	if (sb->sb_inprogress == 1 && sb->sb_uquotino)  {
+
+	if (sb->sb_inprogress == 1 && sb->sb_uquotino != NULLFSINO)  {
 		if (!no_modify)
 			sb->sb_uquotino = 0;
 		if (sb->sb_versionnum & XR_PART_SECSB_VNMASK || !do_bzero)  {
@@ -318,13 +362,30 @@ secondary_sb_wack(xfs_mount_t *mp, xfs_buf_t *sbuf, xfs_sb_t *sb,
 			rval |= XR_AG_SB_SEC;
 	}
 
-	if (sb->sb_inprogress == 1 && sb->sb_gquotino)  {
-		if (!no_modify)
+	if (sb->sb_inprogress == 1 && sb->sb_gquotino != NULLFSINO)  {
+		if (!no_modify) {
 			sb->sb_gquotino = 0;
+			dsb->sb_gquotino = 0;
+		}
 		if (sb->sb_versionnum & XR_PART_SECSB_VNMASK || !do_bzero)  {
 			rval |= XR_AG_SB;
 			do_warn(
 		_("non-null group quota inode field in superblock %d\n"),
+				i);
+
+		} else
+			rval |= XR_AG_SB_SEC;
+	}
+
+	if (sb->sb_inprogress == 1 && sb->sb_pquotino != NULLFSINO)  {
+		if (!no_modify) {
+			sb->sb_pquotino = 0;
+			dsb->sb_pquotino = 0;
+		}
+		if (sb->sb_versionnum & XR_PART_SECSB_VNMASK || !do_bzero)  {
+			rval |= XR_AG_SB;
+			do_warn(
+		_("non-null project quota inode field in superblock %d\n"),
 				i);
 
 		} else
@@ -425,7 +486,7 @@ verify_set_agheader(xfs_mount_t *mp, xfs_buf_t *sbuf, xfs_sb_t *sb,
 	int status = XR_OK;
 	int status_sb = XR_OK;
 
-	status = verify_sb(sb, (i == 0));
+	status = verify_sb(sbuf->b_addr, sb, (i == 0));
 
 	if (status != XR_OK)  {
 		do_warn(_("bad on-disk superblock %d - %s\n"),

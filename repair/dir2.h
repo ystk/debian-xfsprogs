@@ -42,7 +42,7 @@ struct bmap_ext;
  * Currently, we just trash it.
  */
 typedef struct dir2_level_state  {
-	xfs_dabuf_t	*bp;		/* block bp */
+	xfs_buf_t	*bp;		/* block bp */
 	xfs_dablk_t	bno;		/* file block number */
 	xfs_dahash_t	hashval;	/* last verified hashval */
 	int		index;		/* current index in block */
@@ -59,30 +59,6 @@ typedef struct dir2_bt_cursor  {
 	struct blkmap		*blkmap;
 } dir2_bt_cursor_t;
 
-
-/* ROUTINES */
-
-void
-err_release_dir2_cursor(
-	xfs_mount_t		*mp,
-	dir2_bt_cursor_t	*cursor,
-	int			prev_level);
-
-xfs_dabuf_t *
-da_read_buf(
-	xfs_mount_t	*mp,
-	int		nex,
-	struct bmap_ext	*bmp);
-
-int
-da_bwrite(
-	xfs_mount_t	*mp,
-	xfs_dabuf_t	*bp);
-
-void
-da_brelse(
-	xfs_dabuf_t	*bp);
-
 int
 process_dir2(
 	xfs_mount_t	*mp,
@@ -96,15 +72,17 @@ process_dir2(
 
 void
 process_sf_dir2_fixi8(
-	xfs_dir2_sf_t		*sfp,
+	struct xfs_mount	*mp,
+	struct xfs_dir2_sf_hdr	*sfp,
 	xfs_dir2_sf_entry_t	**next_sfep);
-
-void
-dir2_add_badlist(
-	xfs_ino_t	ino);
 
 int
 dir2_is_badino(
 	xfs_ino_t	ino);
+
+int
+namecheck(
+	char		*name,
+	int		length);
 
 #endif	/* _XR_DIR2_H */

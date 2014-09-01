@@ -27,7 +27,7 @@ char *progname;
 void
 usage()
 {
-	fprintf(stderr, _("%s [-e extsize] [-p] source target\n"), progname);
+	fprintf(stderr, _("%s [-e extsize] [-p] [-V] source target\n"), progname);
 	exit(2);
 }
 
@@ -224,6 +224,7 @@ rtcp( char *source, char *target, int fextsize)
 		if ( !(fsxattr.fsx_xflags & XFS_XFLAG_REALTIME) ) {
 			fprintf(stderr, _("%s: %s is not a realtime file.\n"),
 				progname, tbuf);
+			close( tofd );
 			return( -1 );
 		}
 
@@ -234,6 +235,7 @@ rtcp( char *source, char *target, int fextsize)
 			fprintf(stderr, _("%s: %s file extent size is %d, "
 					"instead of %d.\n"),
 				progname, tbuf, fsxattr.fsx_extsize, fextsize);
+			close( tofd );
 			return( -1 );
 		}
 	}

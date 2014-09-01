@@ -88,7 +88,6 @@ bmap(
 		}
 	} else if (fmt == XFS_DINODE_FMT_BTREE) {
 		push_cur();
-		bno = NULLFSBLOCK;
 		rblock = (xfs_bmdr_block_t *)XFS_DFORK_PTR(dip, whichfork);
 		fsize = XFS_DFORK_SIZE(dip, mp, whichfork);
 		pp = XFS_BMDR_PTR_ADDR(rblock, 1, xfs_bmdr_maxrecs(mp, fsize, 0));
@@ -101,9 +100,9 @@ bmap(
 			block = (struct xfs_btree_block *)iocur_top->data;
 			if (be16_to_cpu(block->bb_level) == 0)
 				break;
-			pp = XFS_BMDR_PTR_ADDR(block, 1,
+			pp = XFS_BMBT_PTR_ADDR(mp, block, 1,
 				xfs_bmbt_maxrecs(mp, mp->m_sb.sb_blocksize, 0));
-			kp = XFS_BMDR_KEY_ADDR(block, 1);
+			kp = XFS_BMBT_KEY_ADDR(mp, block, 1);
 			bno = select_child(curoffset, kp, pp,
 					be16_to_cpu(block->bb_numrecs));
 		}
@@ -293,20 +292,13 @@ make_bbmap(
 	int		nex,
 	bmap_ext_t	*bmp)
 {
-	int		d;
-	xfs_dfsbno_t	dfsbno;
 	int		i;
-	int		j;
-	int		k;
 
-	for (i = 0, d = 0; i < nex; i++) {
-		dfsbno = bmp[i].startblock;
-		for (j = 0; j < bmp[i].blockcount; j++, dfsbno++) {
-			for (k = 0; k < blkbb; k++)
-				bbmap->b[d++] =
-					XFS_FSB_TO_DADDR(mp, dfsbno) + k;
-		}
+	for (i = 0; i < nex; i++) {
+		bbmap->b[i].bm_bn = XFS_FSB_TO_DADDR(mp, bmp[i].startblock);
+		bbmap->b[i].bm_len = XFS_FSB_TO_BB(mp, bmp[i].blockcount);
 	}
+	bbmap->nmaps = nex;
 }
 
 static xfs_fsblock_t
