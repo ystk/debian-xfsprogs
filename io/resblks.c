@@ -16,9 +16,8 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/xfs.h>
-#include <xfs/command.h>
-#include <xfs/input.h>
+#include "command.h"
+#include "input.h"
 #include "init.h"
 #include "io.h"
 
@@ -58,7 +57,7 @@ resblks_f(
 void
 resblks_init(void)
 {
-	resblks_cmd.name = _("resblks");
+	resblks_cmd.name = "resblks";
 	resblks_cmd.cfunc = resblks_f;
 	resblks_cmd.argmin = 0;
 	resblks_cmd.argmax = 1;

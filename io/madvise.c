@@ -16,9 +16,8 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/xfs.h>
-#include <xfs/command.h>
-#include <xfs/input.h>
+#include "command.h"
+#include "input.h"
 #include <sys/mman.h>
 #include "init.h"
 #include "io.h"
@@ -118,8 +117,8 @@ madvise_f(
 void
 madvise_init(void)
 {
-	madvise_cmd.name = _("madvise");
-	madvise_cmd.altname = _("ma");
+	madvise_cmd.name = "madvise";
+	madvise_cmd.altname = "ma";
 	madvise_cmd.cfunc = madvise_f;
 	madvise_cmd.argmin = 0;
 	madvise_cmd.argmax = -1;

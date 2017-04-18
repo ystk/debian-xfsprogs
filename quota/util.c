@@ -17,6 +17,7 @@
  */
 
 #include <sys/types.h>
+#include <stdbool.h>
 #include <pwd.h>
 #include <grp.h>
 #include <utmp.h>
@@ -42,8 +43,18 @@ time_to_string(
 		time(&now);
 		timer = MAX(origin - now, 0);
 	}
-	if (timer > 60)	/* roundup */
-		timer += 30;
+
+	/*
+	 * If we are in verbose mode, or if less than a day remains, we
+	 * will show "X days hh:mm:ss" so the user knows the exact timer status.
+	 *
+	 * Otherwise, we round down to the nearest day - so we add 30s here
+	 * such that setting and reporting a limit in rapid succession will
+	 * show the limit which was just set, rather than immediately reporting
+	 * one day less.
+	 */
+	if ((timer > SECONDS_IN_A_DAY) && !(flags & VERBOSE_FLAG))
+		timer += 30;	/* seconds */
 
 	days = timer / SECONDS_IN_A_DAY;
 	if (days)
@@ -172,18 +183,18 @@ num_to_string(
 
 char *
 pct_to_string(
-	__uint64_t	v,
-	__uint64_t	t,
-	char		*sp,
+	__uint64_t	portion,
+	__uint64_t	whole,
+	char		*buf,
 	uint		size)
 {
-	if (t == 0 || v == 0)
-		snprintf(sp, size, "%3u", (uint)0);
-	else if (t == v)
-		snprintf(sp, size, "%3u", (uint)100);
-	else
-		snprintf(sp, size, "%3u", (uint)(((double)v / t) * 100 + 1));
-	return sp;
+	uint		percent;
+
+	percent = whole ? (uint) (100.0 * portion / whole + 0.5) : 0;
+	if (snprintf(buf, size, "%3u", percent) < 0)
+		return "???";
+
+	return buf;
 }
 
 char *

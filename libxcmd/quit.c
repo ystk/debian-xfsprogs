@@ -16,8 +16,9 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/xfs.h>
-#include <xfs/command.h>
+#include "platform_defs.h"
+#include "command.h"
+#include "../quota/init.h"
 
 static cmdinfo_t quit_cmd;
 
@@ -33,12 +34,12 @@ quit_f(
 void
 quit_init(void)
 {
-	quit_cmd.name = _("quit");
-	quit_cmd.altname = _("q");
+	quit_cmd.name = "quit";
+	quit_cmd.altname = "q";
 	quit_cmd.cfunc = quit_f;
 	quit_cmd.argmin = -1;
 	quit_cmd.argmax = -1;
-	quit_cmd.flags = CMD_FLAG_GLOBAL;
+	quit_cmd.flags = CMD_FLAG_GLOBAL | CMD_ALL_FSTYPES;
 	quit_cmd.oneline = _("exit the program");
 
 	add_command(&quit_cmd);

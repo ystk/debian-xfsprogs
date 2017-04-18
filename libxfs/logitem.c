@@ -16,223 +16,20 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs.h>
+#include "libxfs_priv.h"
+#include "xfs_fs.h"
+#include "xfs_shared.h"
+#include "xfs_format.h"
+#include "xfs_log_format.h"
+#include "xfs_trans_resv.h"
+#include "xfs_mount.h"
+#include "xfs_inode_buf.h"
+#include "xfs_inode_fork.h"
+#include "xfs_inode.h"
+#include "xfs_trans.h"
 
 kmem_zone_t	*xfs_buf_item_zone;
 kmem_zone_t	*xfs_ili_zone;		/* inode log item zone */
-
-/*
- * Following functions from fs/xfs/xfs_trans_item.c
- */
-
-/*
- * This is called to add the given log item to the transaction's
- * list of log items.  It must find a free log item descriptor
- * or allocate a new one and add the item to that descriptor.
- * The function returns a pointer to item descriptor used to point
- * to the new item.  The log item will now point to its new descriptor
- * with its li_desc field.
- */
-xfs_log_item_desc_t *
-xfs_trans_add_item(
-	xfs_trans_t		*tp,
-	xfs_log_item_t		*lip)
-{
-	xfs_log_item_desc_t	*lidp;
-	xfs_log_item_chunk_t	*licp;
-	int			i = 0;
-
-	/*
-	 * If there are no free descriptors, allocate a new chunk
-	 * of them and put it at the front of the chunk list.
-	 */
-	if (tp->t_items_free == 0) {
-		licp = (xfs_log_item_chunk_t*)
-		       kmem_alloc(sizeof(xfs_log_item_chunk_t), KM_SLEEP);
-		ASSERT(licp != NULL);
-		/*
-		 * Initialize the chunk, and then
-		 * claim the first slot in the newly allocated chunk.
-		 */
-		xfs_lic_init(licp);
-		xfs_lic_claim(licp, 0);
-		licp->lic_unused = 1;
-		xfs_lic_init_slot(licp, 0);
-		lidp = xfs_lic_slot(licp, 0);
-
-		/*
-		 * Link in the new chunk and update the free count.
-		 */
-		licp->lic_next = tp->t_items.lic_next;
-		tp->t_items.lic_next = licp;
-		tp->t_items_free = XFS_LIC_NUM_SLOTS - 1;
-
-		/*
-		 * Initialize the descriptor and the generic portion
-		 * of the log item.
-		 *
-		 * Point the new slot at this item and return it.
-		 * Also point the log item at its currently active
-		 * descriptor and set the item's mount pointer.
-		 */
-		lidp->lid_item = lip;
-		lidp->lid_flags = 0;
-		lidp->lid_size = 0;
-		lip->li_desc = lidp;
-		lip->li_mountp = tp->t_mountp;
-		return lidp;
-	}
-
-	/*
-	 * Find the free descriptor. It is somewhere in the chunklist
-	 * of descriptors.
-	 */
-	licp = &tp->t_items;
-	while (licp != NULL) {
-		if (xfs_lic_vacancy(licp)) {
-			if (licp->lic_unused <= XFS_LIC_MAX_SLOT) {
-				i = licp->lic_unused;
-				ASSERT(xfs_lic_isfree(licp, i));
-				break;
-			}
-			for (i = 0; i <= XFS_LIC_MAX_SLOT; i++) {
-				if (xfs_lic_isfree(licp, i))
-					break;
-			}
-			ASSERT(i <= XFS_LIC_MAX_SLOT);
-			break;
-		}
-		licp = licp->lic_next;
-	}
-	ASSERT(licp != NULL);
-	/*
-	 * If we find a free descriptor, claim it,
-	 * initialize it, and return it.
-	 */
-	xfs_lic_claim(licp, i);
-	if (licp->lic_unused <= i) {
-		licp->lic_unused = i + 1;
-		xfs_lic_init_slot(licp, i);
-	}
-	lidp = xfs_lic_slot(licp, i);
-	tp->t_items_free--;
-	lidp->lid_item = lip;
-	lidp->lid_flags = 0;
-	lidp->lid_size = 0;
-	lip->li_desc = lidp;
-	lip->li_mountp = tp->t_mountp;
-	return lidp;
-}
-
-/*
- * Free the given descriptor.
- *
- * This requires setting the bit in the chunk's free mask corresponding
- * to the given slot.
- */
-void
-xfs_trans_free_item(
-	xfs_trans_t		*tp,
-	xfs_log_item_desc_t	*lidp)
-{
-	uint			slot;
-	xfs_log_item_chunk_t	*licp;
-	xfs_log_item_chunk_t	**licpp;
-
-	slot = xfs_lic_desc_to_slot(lidp);
-	licp = xfs_lic_desc_to_chunk(lidp);
-	xfs_lic_relse(licp, slot);
-	lidp->lid_item->li_desc = NULL;
-	tp->t_items_free++;
-
-	/*
-	 * If there are no more used items in the chunk and this is not
-	 * the chunk embedded in the transaction structure, then free
-	 * the chunk. First pull it from the chunk list and then
-	 * free it back to the heap.  We didn't bother with a doubly
-	 * linked list here because the lists should be very short
-	 * and this is not a performance path.  It's better to save
-	 * the memory of the extra pointer.
-	 *
-	 * Also decrement the transaction structure's count of free items
-	 * by the number in a chunk since we are freeing an empty chunk.
-	 */
-	if (xfs_lic_are_all_free(licp) && (licp != &(tp->t_items))) {
-		licpp = &(tp->t_items.lic_next);
-		while (*licpp != licp) {
-			ASSERT(*licpp != NULL);
-			licpp = &((*licpp)->lic_next);
-		}
-		*licpp = licp->lic_next;
-		kmem_free(licp);
-		tp->t_items_free -= XFS_LIC_NUM_SLOTS;
-	}
-}
-
-/*
- * This is called to find the descriptor corresponding to the given
- * log item.  It returns a pointer to the descriptor.
- * The log item MUST have a corresponding descriptor in the given
- * transaction.	 This routine does not return NULL, it panics.
- *
- * The descriptor pointer is kept in the log item's li_desc field.
- * Just return it.
- */
-xfs_log_item_desc_t *
-xfs_trans_find_item(
-	xfs_trans_t		*tp,
-	xfs_log_item_t		*lip)
-{
-	ASSERT(lip->li_desc != NULL);
-
-	return lip->li_desc;
-}
-
-/*
- * This is called to unlock all of the items of a transaction and to free
- * all the descriptors of that transaction.
- *
- * It walks the list of descriptors and unlocks each item.  It frees
- * each chunk except that embedded in the transaction as it goes along.
- */
-void
-xfs_trans_free_items(
-	xfs_trans_t		*tp,
-	int			flags)
-{
-	xfs_log_item_chunk_t	*licp;
-	xfs_log_item_chunk_t	*next_licp;
-	int			abort;
-
-	abort = flags & XFS_TRANS_ABORT;
-	licp = &tp->t_items;
-	/*
-	 * Special case the embedded chunk so we don't free it below.
-	 */
-	if (!xfs_lic_are_all_free(licp)) {
-		(void) xfs_trans_unlock_chunk(licp, 1, abort, NULLCOMMITLSN);
-		xfs_lic_all_free(licp);
-		licp->lic_unused = 0;
-	}
-	licp = licp->lic_next;
-
-	/*
-	 * Unlock each item in each chunk and free the chunks.
-	 */
-	while (licp != NULL) {
-		ASSERT(!xfs_lic_are_all_free(licp));
-		(void) xfs_trans_unlock_chunk(licp, 1, abort, NULLCOMMITLSN);
-		next_licp = licp->lic_next;
-		kmem_free(licp);
-		licp = next_licp;
-	}
-
-	/*
-	 * Reset the transaction structure's free item count.
-	 */
-	tp->t_items_free = XFS_LIC_NUM_SLOTS;
-	tp->t_items.lic_next = NULL;
-}
 
 /*
  * Following functions from fs/xfs/xfs_trans_buf.c
@@ -240,159 +37,36 @@ xfs_trans_free_items(
 
 /*
  * Check to see if a buffer matching the given parameters is already
- * a part of the given transaction.  Only check the first, embedded
- * chunk, since we don't want to spend all day scanning large transactions.
+ * a part of the given transaction.
  */
 xfs_buf_t *
 xfs_trans_buf_item_match(
 	xfs_trans_t		*tp,
-	xfs_buftarg_t		*target,
-	xfs_daddr_t		blkno,
-	int			len)
+	struct xfs_buftarg	*btp,
+	struct xfs_buf_map	*map,
+	int			nmaps)
 {
-	xfs_log_item_chunk_t	*licp;
-	xfs_log_item_desc_t	*lidp;
-	xfs_buf_log_item_t	*blip;
-	xfs_buf_t		*bp;
+        struct xfs_log_item_desc *lidp;
+        struct xfs_buf_log_item *blip;
+	int			len = 0;
 	int			i;
 
-#ifdef LI_DEBUG
-	fprintf(stderr, "buf_item_match (fast) log items for xact %p\n", tp);
-#endif
+	for (i = 0; i < nmaps; i++)
+		len += map[i].bm_len;
 
-	bp = NULL;
-	len = BBTOB(len);
-	licp = &tp->t_items;
-	if (!xfs_lic_are_all_free(licp)) {
-		for (i = 0; i < licp->lic_unused; i++) {
-			/*
-			 * Skip unoccupied slots.
-			 */
-			if (xfs_lic_isfree(licp, i)) {
-				continue;
-			}
-
-			lidp = xfs_lic_slot(licp, i);
-			blip = (xfs_buf_log_item_t *)lidp->lid_item;
-#ifdef LI_DEBUG
-			fprintf(stderr,
-				"\tfound log item, xact %p, blip=%p (%d/%d)\n",
-				tp, blip, i, licp->lic_unused);
-#endif
-			if (blip->bli_item.li_type != XFS_LI_BUF) {
-				continue;
-			}
-
-			bp = blip->bli_buf;
-#ifdef LI_DEBUG
-			fprintf(stderr,
-			"\tfound buf %p log item, xact %p, blip=%p (%d)\n",
-				bp, tp, blip, i);
-#endif
-			if ((XFS_BUF_TARGET(bp) == target->dev) &&
-			    (XFS_BUF_ADDR(bp) == blkno) &&
-			    (XFS_BUF_COUNT(bp) == len)) {
-				/*
-				 * We found it.	 Break out and
-				 * return the pointer to the buffer.
-				 */
-#ifdef LI_DEBUG
-				fprintf(stderr,
-					"\tfound REAL buf log item, bp=%p\n",
-					bp);
-#endif
-				break;
-			} else {
-				bp = NULL;
-			}
+        list_for_each_entry(lidp, &tp->t_items, lid_trans) {
+                blip = (struct xfs_buf_log_item *)lidp->lid_item;
+                if (blip->bli_item.li_type == XFS_LI_BUF &&
+		    blip->bli_buf->b_target->dev == btp->dev &&
+		    XFS_BUF_ADDR(blip->bli_buf) == map[0].bm_bn &&
+		    blip->bli_buf->b_bcount == BBTOB(len)) {
+			ASSERT(blip->bli_buf->b_map_count == nmaps);
+                        return blip->bli_buf;
 		}
-	}
-#ifdef LI_DEBUG
-	if (!bp) fprintf(stderr, "\tfast search - got nothing\n");
-#endif
-	return bp;
+        }
+
+        return NULL;
 }
-
-/*
- * Check to see if a buffer matching the given parameters is already
- * a part of the given transaction.  Check all the chunks, we
- * want to be thorough.
- */
-xfs_buf_t *
-xfs_trans_buf_item_match_all(
-	xfs_trans_t		*tp,
-	xfs_buftarg_t		*target,
-	xfs_daddr_t		blkno,
-	int			len)
-{
-	xfs_log_item_chunk_t	*licp;
-	xfs_log_item_desc_t	*lidp;
-	xfs_buf_log_item_t	*blip;
-	xfs_buf_t		*bp;
-	int			i;
-
-#ifdef LI_DEBUG
-	fprintf(stderr, "buf_item_match_all (slow) log items for xact %p\n",
-		tp);
-#endif
-
-	bp = NULL;
-	len = BBTOB(len);
-	for (licp = &tp->t_items; licp != NULL; licp = licp->lic_next) {
-		if (xfs_lic_are_all_free(licp)) {
-			ASSERT(licp == &tp->t_items);
-			ASSERT(licp->lic_next == NULL);
-			return NULL;
-		}
-		for (i = 0; i < licp->lic_unused; i++) {
-			/*
-			 * Skip unoccupied slots.
-			 */
-			if (xfs_lic_isfree(licp, i)) {
-				continue;
-			}
-
-			lidp = xfs_lic_slot(licp, i);
-			blip = (xfs_buf_log_item_t *)lidp->lid_item;
-#ifdef LI_DEBUG
-			fprintf(stderr,
-				"\tfound log item, xact %p, blip=%p (%d/%d)\n",
-				tp, blip, i, licp->lic_unused);
-#endif
-			if (blip->bli_item.li_type != XFS_LI_BUF) {
-				continue;
-			}
-
-			bp = blip->bli_buf;
-			ASSERT(bp);
-			ASSERT(XFS_BUF_ADDR(bp));
-#ifdef LI_DEBUG
-			fprintf(stderr,
-			"\tfound buf %p log item, xact %p, blip=%p (%d)\n",
-				bp, tp, blip, i);
-#endif
-			if ((XFS_BUF_TARGET(bp) == target->dev) &&
-			    (XFS_BUF_ADDR(bp) == blkno) &&
-			    (XFS_BUF_COUNT(bp) == len)) {
-				/*
-				 * We found it.	 Break out and
-				 * return the pointer to the buffer.
-				 */
-#ifdef LI_DEBUG
-				fprintf(stderr,
-					"\tfound REAL buf log item, bp=%p\n",
-					bp);
-#endif
-				return bp;
-			}
-		}
-	}
-#ifdef LI_DEBUG
-	if (!bp) fprintf(stderr, "slow search - got nothing\n");
-#endif
-	return NULL;
-}
-
 /*
  * The following are from fs/xfs/xfs_buf_item.c
  */
@@ -448,7 +122,7 @@ xfs_buf_item_init(
 	bip->bli_buf = bp;
 	bip->bli_format.blf_type = XFS_LI_BUF;
 	bip->bli_format.blf_blkno = (__int64_t)XFS_BUF_ADDR(bp);
-	bip->bli_format.blf_len = (ushort)BTOBB(XFS_BUF_COUNT(bp));
+	bip->bli_format.blf_len = (unsigned short)BTOBB(XFS_BUF_COUNT(bp));
 	XFS_BUF_SET_FSPRIVATE(bp, bip);
 }
 
@@ -493,7 +167,7 @@ xfs_inode_item_init(
 	iip->ili_inode = ip;
 	iip->ili_format.ilf_type = XFS_LI_INODE;
 	iip->ili_format.ilf_ino = ip->i_ino;
-	iip->ili_format.ilf_blkno = ip->i_blkno;
-	iip->ili_format.ilf_len = ip->i_len;
-	iip->ili_format.ilf_boffset = ip->i_boffset;
+	iip->ili_format.ilf_blkno = ip->i_imap.im_blkno;
+	iip->ili_format.ilf_len = ip->i_imap.im_len;
+	iip->ili_format.ilf_boffset = ip->i_imap.im_boffset;
 }

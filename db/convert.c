@@ -16,7 +16,7 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/libxfs.h>
+#include "libxfs.h"
 #include "command.h"
 #include "convert.h"
 #include "output.h"
@@ -157,7 +157,7 @@ convert_f(int argc, char **argv)
 {
 	ctype_t		c;
 	int		conmask;
-	cval_t		cvals[NCTS];
+	cval_t		cvals[NCTS] = {};
 	int		i;
 	int		mask;
 	__uint64_t	v;
@@ -200,7 +200,6 @@ convert_f(int argc, char **argv)
 	if (cur_agno != NULLAGNUMBER && (conmask & M(AGNUMBER)) == 0) {
 		cvals[CT_AGNUMBER].agnumber = cur_agno;
 		mask |= M(AGNUMBER);
-		conmask |= ~ctydescs[CT_AGNUMBER].allowed;
 	}
 	v = 0;
 	for (c = (ctype_t)0; c < NCTS; c++) {
@@ -210,14 +209,14 @@ convert_f(int argc, char **argv)
 	}
 	switch (wtype) {
 	case CT_AGBLOCK:
-		v = XFS_DADDR_TO_AGBNO(mp, v >> BBSHIFT);
+		v = xfs_daddr_to_agbno(mp, v >> BBSHIFT);
 		break;
 	case CT_AGINO:
 		v = (v >> mp->m_sb.sb_inodelog) %
 		    (mp->m_sb.sb_agblocks << mp->m_sb.sb_inopblog);
 		break;
 	case CT_AGNUMBER:
-		v = XFS_DADDR_TO_AGNO(mp, v >> BBSHIFT);
+		v = xfs_daddr_to_agno(mp, v >> BBSHIFT);
 		break;
 	case CT_BBOFF:
 		v &= BBMASK;
@@ -234,7 +233,7 @@ convert_f(int argc, char **argv)
 		v = XFS_DADDR_TO_FSB(mp, v >> BBSHIFT);
 		break;
 	case CT_INO:
-		v = XFS_AGINO_TO_INO(mp, XFS_DADDR_TO_AGNO(mp, v >> BBSHIFT),
+		v = XFS_AGINO_TO_INO(mp, xfs_daddr_to_agno(mp, v >> BBSHIFT),
 			(v >> mp->m_sb.sb_inodelog) %
 			(mp->m_sb.sb_agblocks << mp->m_sb.sb_inopblog));
 		break;

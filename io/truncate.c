@@ -16,9 +16,8 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/xfs.h>
-#include <xfs/command.h>
-#include <xfs/input.h>
+#include "command.h"
+#include "input.h"
 #include "init.h"
 #include "io.h"
 
@@ -39,7 +38,7 @@ truncate_f(
 		return 0;
 	}
 
-	if (ftruncate64(file->fd, offset) < 0) {
+	if (ftruncate(file->fd, offset) < 0) {
 		perror("ftruncate");
 		return 0;
 	}
@@ -49,8 +48,8 @@ truncate_f(
 void
 truncate_init(void)
 {
-	truncate_cmd.name = _("truncate");
-	truncate_cmd.altname = _("t");
+	truncate_cmd.name = "truncate";
+	truncate_cmd.altname = "t";
 	truncate_cmd.cfunc = truncate_f;
 	truncate_cmd.argmin = 1;
 	truncate_cmd.argmax = 1;

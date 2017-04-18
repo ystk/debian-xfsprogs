@@ -16,9 +16,8 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/xfs.h>
-#include <xfs/command.h>
-#include <xfs/input.h>
+#include "command.h"
+#include "input.h"
 #include <sys/mman.h>
 #include "init.h"
 #include "io.h"
@@ -113,8 +112,8 @@ mincore_f(
 void
 mincore_init(void)
 {
-	mincore_cmd.name = _("mincore");
-	mincore_cmd.altname = _("mi");
+	mincore_cmd.name = "mincore";
+	mincore_cmd.altname = "mi";
 	mincore_cmd.cfunc = mincore_f;
 	mincore_cmd.argmin = 0;
 	mincore_cmd.argmax = 2;

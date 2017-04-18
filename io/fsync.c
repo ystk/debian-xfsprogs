@@ -16,8 +16,8 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/xfs.h>
-#include <xfs/command.h>
+#include "platform_defs.h"
+#include "command.h"
 #include "init.h"
 #include "io.h"
 
@@ -51,15 +51,15 @@ fdatasync_f(
 void
 fsync_init(void)
 {
-	fsync_cmd.name = _("fsync");
-	fsync_cmd.altname = _("s");
+	fsync_cmd.name = "fsync";
+	fsync_cmd.altname = "s";
 	fsync_cmd.cfunc = fsync_f;
 	fsync_cmd.flags = CMD_NOMAP_OK | CMD_FOREIGN_OK;
 	fsync_cmd.oneline =
 		_("calls fsync(2) to flush all in-core file state to disk");
 
-	fdatasync_cmd.name = _("fdatasync");
-	fdatasync_cmd.altname = _("ds");
+	fdatasync_cmd.name = "fdatasync";
+	fdatasync_cmd.altname = "ds";
 	fdatasync_cmd.cfunc = fdatasync_f;
 	fdatasync_cmd.flags = CMD_NOMAP_OK | CMD_FOREIGN_OK;
 	fdatasync_cmd.oneline =

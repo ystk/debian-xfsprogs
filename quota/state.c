@@ -15,8 +15,8 @@
  * along with this program; if not, write the Free Software Foundation,
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
-
-#include <xfs/command.h>
+#include <stdbool.h>
+#include "command.h"
 #include "init.h"
 #include "quota.h"
 
@@ -111,21 +111,24 @@ remove_help(void)
 
 static void
 state_qfilestat(
-	FILE		*fp,
-	fs_path_t	*mount,
-	uint		type,
-	fs_qfilestat_t	*qfs,
-	int		accounting,
-	int		enforcing)
+	FILE			*fp,
+	struct fs_path		*mount,
+	uint			type,
+	struct fs_qfilestatv	*qfs,
+	int			accounting,
+	int			enforcing)
 {
 	fprintf(fp, _("%s quota state on %s (%s)\n"), type_to_string(type),
 		mount->fs_dir, mount->fs_name);
 	fprintf(fp, _("  Accounting: %s\n"), accounting ? _("ON") : _("OFF"));
 	fprintf(fp, _("  Enforcement: %s\n"), enforcing ? _("ON") : _("OFF"));
-	fprintf(fp, _("  Inode: #%llu (%llu blocks, %lu extents)\n"),
-		(unsigned long long)qfs->qfs_ino,
-		(unsigned long long)qfs->qfs_nblks,
-		(unsigned long)qfs->qfs_nextents);
+	if (qfs->qfs_ino != (__u64) -1)
+		fprintf(fp, _("  Inode: #%llu (%llu blocks, %lu extents)\n"),
+			(unsigned long long)qfs->qfs_ino,
+			(unsigned long long)qfs->qfs_nblks,
+			(unsigned long)qfs->qfs_nextents);
+	else
+		fprintf(fp, _("  Inode: N/A\n"));
 }
 
 static void
@@ -139,39 +142,96 @@ state_timelimit(
 		time_to_string(timelimit, VERBOSE_FLAG | ABSOLUTE_FLAG));
 }
 
+/*
+ * fs_quota_stat holds a subset of fs_quota_statv; this copies
+ * the smaller into the larger, leaving any not-present fields
+ * empty.  This is so the same reporting function can be used
+ * for both XFS_GETQSTAT and XFS_GETQSTATV results.
+ */
+static void
+state_stat_to_statv(
+	struct fs_quota_stat	*s,
+	struct fs_quota_statv	*sv)
+{
+	memset(sv, 0, sizeof(struct fs_quota_statv));
+
+	/* shared information */
+	sv->qs_version = s->qs_version;
+	sv->qs_flags = s->qs_flags;
+	sv->qs_incoredqs = s->qs_incoredqs;
+	sv->qs_btimelimit = s->qs_btimelimit;
+	sv->qs_itimelimit = s->qs_itimelimit;
+	sv->qs_rtbtimelimit = s->qs_rtbtimelimit;
+	sv->qs_bwarnlimit = s->qs_bwarnlimit;
+	sv->qs_iwarnlimit = s->qs_iwarnlimit;
+
+	/* Always room for uquota */
+	sv->qs_uquota.qfs_ino = s->qs_uquota.qfs_ino;
+	sv->qs_uquota.qfs_nblks = s->qs_uquota.qfs_nblks;
+	sv->qs_uquota.qfs_nextents = s->qs_uquota.qfs_nextents;
+
+	/*
+	 * If we are here, XFS_GETQSTATV failed and XFS_GETQSTAT passed;
+	 * that is a very strong hint that we're on a kernel which predates
+	 * the on-disk pquota inode; both were added in v3.12.  So, we do
+	 * some tricksy determination here.
+	 * gs_gquota may hold either group quota inode info, or project
+	 * quota if that is used instead; which one it actually holds depends
+	 * on the quota flags.  (If neither is set, neither is used)
+	 */
+	if (s->qs_flags & XFS_QUOTA_GDQ_ACCT) {
+		/* gs_gquota holds group quota info */
+		sv->qs_gquota.qfs_ino = s->qs_gquota.qfs_ino;
+		sv->qs_gquota.qfs_nblks = s->qs_gquota.qfs_nblks;
+		sv->qs_gquota.qfs_nextents = s->qs_gquota.qfs_nextents;
+	} else if (s->qs_flags & XFS_QUOTA_PDQ_ACCT) {
+		/* gs_gquota actually holds project quota info */
+		sv->qs_pquota.qfs_ino = s->qs_gquota.qfs_ino;
+		sv->qs_pquota.qfs_nblks = s->qs_gquota.qfs_nblks;
+		sv->qs_pquota.qfs_nextents = s->qs_gquota.qfs_nextents;
+	}
+}
+
 static void
 state_quotafile_mount(
-	FILE		*fp,
-	uint		type,
-	fs_path_t	*mount,
-	uint		flags)
+	FILE			*fp,
+	uint			type,
+	struct fs_path		*mount,
+	uint			flags)
 {
-	fs_quota_stat_t	s;
-	char		*dev = mount->fs_name;
+	struct fs_quota_stat	s;
+	struct fs_quota_statv	sv;
+	char			*dev = mount->fs_name;
 
-	if (xfsquotactl(XFS_GETQSTAT, dev, type, 0, (void *)&s) < 0) {
-		if (flags & VERBOSE_FLAG)
-			fprintf(fp, _("%s quota are not enabled on %s\n"),
-				type_to_string(type), dev);
-		return;
+	sv.qs_version = FS_QSTATV_VERSION1;
+
+	if (xfsquotactl(XFS_GETQSTATV, dev, type, 0, (void *)&sv) < 0) {
+		if (xfsquotactl(XFS_GETQSTAT, dev, type, 0, (void *)&s) < 0) {
+			if (flags & VERBOSE_FLAG)
+				fprintf(fp,
+					_("%s quota are not enabled on %s\n"),
+					type_to_string(type), dev);
+			return;
+		}
+		state_stat_to_statv(&s, &sv);
 	}
 
 	if (type & XFS_USER_QUOTA)
-		state_qfilestat(fp, mount, XFS_USER_QUOTA, &s.qs_uquota,
-				s.qs_flags & XFS_QUOTA_UDQ_ACCT,
-				s.qs_flags & XFS_QUOTA_UDQ_ENFD);
+		state_qfilestat(fp, mount, XFS_USER_QUOTA, &sv.qs_uquota,
+				sv.qs_flags & XFS_QUOTA_UDQ_ACCT,
+				sv.qs_flags & XFS_QUOTA_UDQ_ENFD);
 	if (type & XFS_GROUP_QUOTA)
-		state_qfilestat(fp, mount, XFS_GROUP_QUOTA, &s.qs_gquota,
-				s.qs_flags & XFS_QUOTA_GDQ_ACCT,
-				s.qs_flags & XFS_QUOTA_GDQ_ENFD);
+		state_qfilestat(fp, mount, XFS_GROUP_QUOTA, &sv.qs_gquota,
+				sv.qs_flags & XFS_QUOTA_GDQ_ACCT,
+				sv.qs_flags & XFS_QUOTA_GDQ_ENFD);
 	if (type & XFS_PROJ_QUOTA)
-		state_qfilestat(fp, mount, XFS_PROJ_QUOTA, &s.qs_gquota,
-				s.qs_flags & XFS_QUOTA_PDQ_ACCT,
-				s.qs_flags & XFS_QUOTA_PDQ_ENFD);
+		state_qfilestat(fp, mount, XFS_PROJ_QUOTA, &sv.qs_pquota,
+				sv.qs_flags & XFS_QUOTA_PDQ_ACCT,
+				sv.qs_flags & XFS_QUOTA_PDQ_ENFD);
 
-	state_timelimit(fp, XFS_BLOCK_QUOTA, s.qs_btimelimit);
-	state_timelimit(fp, XFS_INODE_QUOTA, s.qs_itimelimit);
-	state_timelimit(fp, XFS_RTBLOCK_QUOTA, s.qs_rtbtimelimit);
+	state_timelimit(fp, XFS_BLOCK_QUOTA, sv.qs_btimelimit);
+	state_timelimit(fp, XFS_INODE_QUOTA, sv.qs_itimelimit);
+	state_timelimit(fp, XFS_RTBLOCK_QUOTA, sv.qs_rtbtimelimit);
 }
 
 static void
@@ -336,14 +396,14 @@ remove_extents(
 	}
 	dir = mount->fs_name;
 	if (type & XFS_USER_QUOTA) {
-		if (remove_qtype_extents(dir, XFS_USER_QUOTA) < 0) 
+		if (remove_qtype_extents(dir, XFS_USER_QUOTA) < 0)
 			return;
 	}
 	if (type & XFS_GROUP_QUOTA) {
-		if (remove_qtype_extents(dir, XFS_GROUP_QUOTA) < 0) 
+		if (remove_qtype_extents(dir, XFS_GROUP_QUOTA) < 0)
 			return;
 	} else if (type & XFS_PROJ_QUOTA) {
-		if (remove_qtype_extents(dir, XFS_PROJ_QUOTA) < 0) 
+		if (remove_qtype_extents(dir, XFS_PROJ_QUOTA) < 0)
 			return;
 	}
 	if (flags & VERBOSE_FLAG)
@@ -517,7 +577,7 @@ remove_f(
 void
 state_init(void)
 {
-	off_cmd.name = _("off");
+	off_cmd.name = "off";
 	off_cmd.cfunc = off_f;
 	off_cmd.argmin = 0;
 	off_cmd.argmax = -1;
@@ -525,15 +585,16 @@ state_init(void)
 	off_cmd.oneline = _("permanently switch quota off for a path");
 	off_cmd.help = off_help;
 
-	state_cmd.name = _("state");
+	state_cmd.name = "state";
 	state_cmd.cfunc = state_f;
 	state_cmd.argmin = 0;
 	state_cmd.argmax = -1;
 	state_cmd.args = _("[-gpu] [-a] [-v] [-f file]");
 	state_cmd.oneline = _("get overall quota state information");
 	state_cmd.help = state_help;
+	state_cmd.flags = CMD_FLAG_FOREIGN_OK;
 
-	enable_cmd.name = _("enable");
+	enable_cmd.name = "enable";
 	enable_cmd.cfunc = enable_f;
 	enable_cmd.argmin = 0;
 	enable_cmd.argmax = -1;
@@ -541,7 +602,7 @@ state_init(void)
 	enable_cmd.oneline = _("enable quota enforcement");
 	enable_cmd.help = enable_help;
 
-	disable_cmd.name = _("disable");
+	disable_cmd.name = "disable";
 	disable_cmd.cfunc = disable_f;
 	disable_cmd.argmin = 0;
 	disable_cmd.argmax = -1;
@@ -549,7 +610,7 @@ state_init(void)
 	disable_cmd.oneline = _("disable quota enforcement");
 	disable_cmd.help = disable_help;
 
-	remove_cmd.name = _("remove");
+	remove_cmd.name = "remove";
 	remove_cmd.cfunc = remove_f;
 	remove_cmd.argmin = 0;
 	remove_cmd.argmax = -1;

@@ -16,7 +16,8 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <xfs/command.h>
+#include <stdbool.h>
+#include "command.h"
 #include "init.h"
 #include "quota.h"
 
@@ -41,6 +42,10 @@ free_help(void)
 "\n"));
 }
 
+/*
+ * The data and realtime block counts returned (count, used, and
+ * free) are all in basic block units.
+ */
 static int
 mount_free_space_data(
 	struct fs_path		*mount,
@@ -72,38 +77,58 @@ mount_free_space_data(
 		close(fd);
 		return 0;
 	}
-	if ((xfsctl(mount->fs_dir, fd, XFS_IOC_FSGEOMETRY_V1, &fsgeo)) < 0) {
-		perror("XFS_IOC_FSGEOMETRY_V1");
-		close(fd);
-		return 0;
-	}
-	if ((xfsctl(mount->fs_dir, fd, XFS_IOC_FSCOUNTS, &fscounts)) < 0) {
-		perror("XFS_IOC_FSCOUNTS");
-		close(fd);
-		return 0;
+
+	if (!(mount->fs_flags & FS_FOREIGN)) {
+		if ((xfsctl(mount->fs_dir, fd, XFS_IOC_FSGEOMETRY_V1,
+							&fsgeo)) < 0) {
+			perror("XFS_IOC_FSGEOMETRY_V1");
+			close(fd);
+			return 0;
+		}
+		if ((xfsctl(mount->fs_dir, fd, XFS_IOC_FSCOUNTS,
+							&fscounts)) < 0) {
+			perror("XFS_IOC_FSCOUNTS");
+			close(fd);
+			return 0;
+		}
+
+		logsize = fsgeo.logstart ? fsgeo.logblocks : 0;
+		count = (fsgeo.datablocks - logsize) * fsgeo.blocksize;
+		free  = fscounts.freedata * fsgeo.blocksize;
+		*bcount = BTOBB(count);
+		*bfree  = BTOBB(free);
+		*bused  = BTOBB(count - free);
+
+		count = fsgeo.rtextents * fsgeo.rtextsize * fsgeo.blocksize;
+		free  = fscounts.freertx * fsgeo.rtextsize * fsgeo.blocksize;
+		*rcount = BTOBB(count);
+		*rfree  = BTOBB(free);
+		*rused  = BTOBB(count - free);
+	} else {
+		count = st.f_blocks * st.f_bsize;
+		free = st.f_bfree * st.f_bsize;
+		*bcount = BTOBB(count);
+		*bfree  = BTOBB(free);
+		*bused  = BTOBB(count - free);
+
+		*rcount = BTOBB(0);
+		*rfree  = BTOBB(0);
+		*rused  = BTOBB(0);
 	}
 
-	logsize = fsgeo.logstart ? fsgeo.logblocks : 0;
-	count = (fsgeo.datablocks - logsize) * fsgeo.blocksize;
-	free  = fscounts.freedata * fsgeo.blocksize;
-	*bcount = BTOBB(count);
-	*bfree  = BTOBB(free);
-	*bused  = BTOBB(count - free);
 
 	*icount = st.f_files;
 	*ifree  = st.f_ffree;
 	*iused  = st.f_files - st.f_ffree;
 
-	count = fsgeo.rtextents * fsgeo.rtextsize * fsgeo.blocksize;
-	free  = fscounts.freertx * fsgeo.rtextsize * fsgeo.blocksize;
-	*rcount = BTOBB(count);
-	*rfree  = BTOBB(free);
-	*rused  = BTOBB(count - free);
-
 	close(fd);
 	return 1;
 }
 
+/*
+ * The data and realtime block counts returned (count, used, and
+ * free) are all in basic block units.
+ */
 static int
 projects_free_space_data(
 	struct fs_path		*path,
@@ -135,13 +160,13 @@ projects_free_space_data(
 		return 0;
 	}
 
-	if ((xfsctl(path->fs_dir, fd, XFS_IOC_FSGETXATTR, &fsx)) < 0) {
+	if ((xfsctl(path->fs_dir, fd, FS_IOC_FSGETXATTR, &fsx)) < 0) {
 		exitcode = 1;
-		perror("XFS_IOC_FSGETXATTR");
+		perror("FS_IOC_FSGETXATTR");
 		close(fd);
 		return 0;
 	}
-	if (!(fsx.fsx_xflags & XFS_XFLAG_PROJINHERIT)) {
+	if (!(fsx.fsx_xflags & FS_XFLAG_PROJINHERIT)) {
 		exitcode = 1;
 		fprintf(stderr, _("%s: project quota flag not set on %s\n"),
 			progname, path->fs_dir);
@@ -173,20 +198,22 @@ projects_free_space_data(
 	}
 
 	if (d.d_blk_softlimit) {
-		*bcount = d.d_blk_softlimit << 1;
-		*bfree = (d.d_blk_softlimit - d.d_bcount) << 1;
+		*bcount = d.d_blk_softlimit;
+		*bfree = (d.d_blk_softlimit - d.d_bcount);
 	}
-	*bused = d.d_bcount << 1;
+	*bused = d.d_bcount;
+
 	if (d.d_ino_softlimit) {
 		*icount = d.d_ino_softlimit;
 		*ifree = (d.d_ino_softlimit - d.d_icount);
 	}
 	*iused = d.d_icount;
+
 	if (d.d_rtb_softlimit) {
-		*rcount = d.d_rtb_softlimit << 1;
-		*rfree = (d.d_rtb_softlimit - d.d_rtbcount) << 1;
+		*rcount = d.d_rtb_softlimit;
+		*rfree = (d.d_rtb_softlimit - d.d_rtbcount);
 	}
-	*rcount = d.d_rtbcount << 1;
+	*rused = d.d_rtbcount;
 
 	close(fd);
 	return 1;
@@ -287,14 +314,13 @@ static void
 free_space_list(
 	FILE			*fp,
 	uint			form,
-	uint			type,
 	char			*dir,
 	uint			flags)
 {
 	fs_cursor_t		cursor;
 	fs_path_t		*path;
 
-	fs_cursor_initialise(dir, type, &cursor);
+	fs_cursor_initialise(dir, 0, &cursor);
 	while ((path = fs_cursor_next_entry(&cursor))) {
 		if (free_space(fp, form, path, flags))
 			flags |= NO_HEADER_FLAG;
@@ -308,7 +334,7 @@ free_f(
 {
 	FILE		*fp = NULL;
 	char		*fname = NULL;
-	int		c, flags = 0, form = 0, type = 0;
+	int		c, flags = 0, form = 0;
 
 	while ((c = getopt(argc, argv, "bf:hNir")) != EOF) {
 		switch (c) {
@@ -338,16 +364,13 @@ free_f(
 	if (!form)
 		form = XFS_BLOCK_QUOTA;
 
-	if (!type)
-		type = FS_MOUNT_POINT|FS_PROJECT_PATH;
-
 	if ((fp = fopen_write_secure(fname)) == NULL)
 		return 0;
 
 	if (argc == optind)
-		free_space_list(fp, form, type, NULL, flags);
+		free_space_list(fp, form, NULL, flags);
 	else while (argc > optind)
-		free_space_list(fp, form, type, argv[optind++], flags);
+		free_space_list(fp, form, argv[optind++], flags);
 
 	if (fname)
 		fclose(fp);
@@ -357,14 +380,15 @@ free_f(
 void
 free_init(void)
 {
-	free_cmd.name = _("df");
-	free_cmd.altname = _("free");
+	free_cmd.name = "df";
+	free_cmd.altname = "free";
 	free_cmd.cfunc = free_f;
 	free_cmd.argmin = 0;
 	free_cmd.argmax = -1;
-	free_cmd.args = _("[-bir] [-hn] [-f file]");
+	free_cmd.args = _("[-bir] [-hN] [-f file]");
 	free_cmd.oneline = _("show free and used counts for blocks and inodes");
 	free_cmd.help = free_help;
+	free_cmd.flags = CMD_FLAG_FOREIGN_OK;
 
 	add_command(&free_cmd);
 }

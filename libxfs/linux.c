@@ -16,15 +16,14 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#define ustat __kernel_ustat
-#include <xfs/libxfs.h>
 #include <mntent.h>
 #include <sys/stat.h>
-#undef ustat
-#include <sys/ustat.h>
 #include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/sysinfo.h>
+
+#include "libxfs_priv.h"
+#include "xfs_fs.h"
 
 int platform_has_uuid = 1;
 extern char *progname;
@@ -46,62 +45,86 @@ static int max_block_alignment;
 
 #define PROC_MOUNTED	"/proc/mounts"
 
-int
-platform_check_ismounted(char *name, char *block, struct stat64 *s, int verbose)
+/*
+ * Check if the filesystem is mounted.  Be verbose if asked, and
+ * optionally restrict check to /writable/ mounts (i.e. RO is OK)
+ */
+#define	CHECK_MOUNT_VERBOSE	0x1
+#define	CHECK_MOUNT_WRITABLE	0x2
+
+static int
+platform_check_mount(char *name, char *block, struct stat *s, int flags)
 {
-	/* Pad ust; pre-2.6.28 linux copies out too much in 32bit compat mode */
-	struct ustat	ust[2];
-	struct stat64	st;
+	FILE		*f;
+	struct stat	st, mst;
+	struct mntent	*mnt;
+	char		mounts[MAXPATHLEN];
 
 	if (!s) {
-		if (stat64(block, &st) < 0)
+		/* If either fails we are not mounted */
+		if (stat(block, &st) < 0)
 			return 0;
 		if ((st.st_mode & S_IFMT) != S_IFBLK)
 			return 0;
 		s = &st;
 	}
 
-	if (ustat(s->st_rdev, ust) >= 0) {
-		if (verbose)
-			fprintf(stderr,
-				_("%s: %s contains a mounted filesystem\n"),
-				progname, name);
+	strcpy(mounts, (!access(PROC_MOUNTED, R_OK)) ? PROC_MOUNTED : MOUNTED);
+	if ((f = setmntent(mounts, "r")) == NULL) {
+		/* Unexpected failure, warn unconditionally */
+		fprintf(stderr,
+		    _("%s: %s possibly contains a mounted filesystem\n"),
+		    progname, name);
 		return 1;
 	}
-	return 0;
+	while ((mnt = getmntent(f)) != NULL) {
+		if (stat(mnt->mnt_dir, &mst) < 0)
+			continue;
+		if (mst.st_dev != s->st_rdev)
+			continue;
+		/* Found our device, is RO OK? */
+		if ((flags & CHECK_MOUNT_WRITABLE) && hasmntopt(mnt, MNTOPT_RO))
+			continue;
+		else
+			break;
+	}
+	endmntent(f);
+
+	/* No mounts contained the condition we were looking for */
+	if (mnt == NULL)
+		return 0;
+
+	if (flags & CHECK_MOUNT_VERBOSE) {
+		if (flags & CHECK_MOUNT_WRITABLE) {
+			fprintf(stderr,
+_("%s: %s contains a mounted and writable filesystem\n"),
+				progname, name);
+		} else {
+			fprintf(stderr,
+_("%s: %s contains a mounted filesystem\n"),
+				progname, name);
+		}
+	}
+	return 1;
 }
 
 int
-platform_check_iswritable(char *name, char *block, struct stat64 *s, int fatal)
+platform_check_ismounted(char *name, char *block, struct stat *s, int verbose)
 {
-	int		sts = 0;
-	FILE		*f;
-	struct stat64	mst;
-	struct mntent	*mnt;
-	char		mounts[MAXPATHLEN];
+	int flags;
 
-	strcpy(mounts, (!access(PROC_MOUNTED, R_OK)) ? PROC_MOUNTED : MOUNTED);
-	if ((f = setmntent(mounts, "r")) == NULL) {
-		fprintf(stderr, _("%s: %s contains a possibly writable, "
-				"mounted filesystem\n"), progname, name);
-			return fatal;
-	}
-	while ((mnt = getmntent(f)) != NULL) {
-		if (stat64(mnt->mnt_fsname, &mst) < 0)
-			continue;
-		if ((mst.st_mode & S_IFMT) != S_IFBLK)
-			continue;
-		if (mst.st_rdev == s->st_rdev
-		    && hasmntopt(mnt, MNTOPT_RO) != NULL)
-			break;
-	}
-	if (mnt == NULL) {
-		fprintf(stderr, _("%s: %s contains a mounted and writable "
-				"filesystem\n"), progname, name);
-		sts = fatal;
-	}
-	endmntent(f);
-	return sts;
+	flags = verbose ? CHECK_MOUNT_VERBOSE : 0;
+	return platform_check_mount(name, block, s, flags);
+}
+
+int
+platform_check_iswritable(char *name, char *block, struct stat *s)
+{
+	int flags;
+
+	/* Writable checks are always verbose */
+	flags = CHECK_MOUNT_WRITABLE | CHECK_MOUNT_VERBOSE;
+	return platform_check_mount(name, block, s, flags);
 }
 
 int
@@ -123,28 +146,49 @@ platform_set_blocksize(int fd, char *path, dev_t device, int blocksize, int fata
 void
 platform_flush_device(int fd, dev_t device)
 {
-	if (major(device) != RAMDISK_MAJOR)
+	struct stat	st;
+	if (major(device) == RAMDISK_MAJOR)
+		return;
+
+	if (fstat(fd, &st) < 0)
+		return;
+
+	if (S_ISREG(st.st_mode))
+		fsync(fd);
+	else
 		ioctl(fd, BLKFLSBUF, 0);
 }
 
 void
 platform_findsizes(char *path, int fd, long long *sz, int *bsz)
 {
-	struct stat64	st;
+	struct stat	st;
 	__uint64_t	size;
 	int		error;
 
-	if (fstat64(fd, &st) < 0) {
+	if (fstat(fd, &st) < 0) {
 		fprintf(stderr, _("%s: "
 			"cannot stat the device file \"%s\": %s\n"),
 			progname, path, strerror(errno));
 		exit(1);
 	}
+
 	if ((st.st_mode & S_IFMT) == S_IFREG) {
+		struct dioattr	da;
+
 		*sz = (long long)(st.st_size >> 9);
-		*bsz = BBSIZE;
-		if (BBSIZE > max_block_alignment)
-			max_block_alignment = BBSIZE;
+
+		if (ioctl(fd, XFS_IOC_DIOINFO, &da) < 0) {
+			/*
+			 * fall back to BBSIZE; mkfs might fail if there's a
+			 * size mismatch between the image & the host fs...
+			 */
+			*bsz = BBSIZE;
+		} else
+			*bsz = da.d_miniosz;
+
+		if (*bsz > max_block_alignment)
+			max_block_alignment = *bsz;
 		return;
 	}
 

@@ -16,7 +16,7 @@
  * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#include <libxfs.h>
+#include "libxfs.h"
 #include "btree.h"
 
 /*
@@ -520,6 +520,7 @@ btree_update_key(
 		return EINVAL;
 
 	btree_update_node_key(root, root->cursor, 0, new_key);
+	root->cur_key = new_key;
 
 	return 0;
 }

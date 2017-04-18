@@ -18,7 +18,7 @@
 #ifndef __PATH_H__
 #define __PATH_H__
 
-#include <xfs/xfs.h>
+#include "platform_defs.h"
 
 /*
  * XFS Filesystem Paths
@@ -29,6 +29,7 @@
 
 #define FS_MOUNT_POINT	(1<<0)
 #define FS_PROJECT_PATH	(1<<1)
+#define FS_FOREIGN	(1<<2)
 
 typedef struct fs_path {
 	char		*fs_name;	/* Data device for filesystem 	*/
@@ -43,15 +44,14 @@ typedef struct fs_path {
 } fs_path_t;
 
 extern int fs_count;		/* number of entries in fs table */
+extern int xfs_fs_count;	/* number of xfs entries in fs table */
 extern fs_path_t *fs_table;	/* array of entries in fs table  */
 extern fs_path_t *fs_path;	/* current entry in the fs table */
 extern char *mtab_file;
 
-extern void fs_table_initialise(void);
+extern void fs_table_initialise(int, char *[], int, char *[]);
 extern void fs_table_destroy(void);
 
-extern void fs_table_insert_mount(char *__mount);
-extern void fs_table_insert_project(char *__project);
 extern void fs_table_insert_project_path(char *__dir, uint __projid);
 
 

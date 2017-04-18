@@ -17,9 +17,10 @@
  */
 
 #include <libgen.h>
-#include <xfs/xfs.h>
-#include <xfs/handle.h>
-#include <xfs/parent.h>
+#include "platform_defs.h"
+#include "xfs.h"
+#include "handle.h"
+#include "parent.h"
 
 /* just pick a value we know is more than big enough */
 #define	MAXHANSIZ	64
@@ -97,6 +98,8 @@ path_to_fshandle(
 		/* new filesystem. add it to the cache */
 		fdhp = malloc(sizeof(struct fdhash));
 		if (fdhp == NULL) {
+			free(*fshanp);
+			close(fd);
 			errno = ENOMEM;
 			return -1;
 		}
@@ -158,7 +161,8 @@ path_to_fspath(char *path)
 	if (S_ISREG(statbuf.st_mode) || S_ISDIR(statbuf.st_mode))
 		return path;
 
-	strcpy(dirpath, path);
+	strncpy(dirpath, path, MAXPATHLEN);
+	dirpath[MAXPATHLEN-1] = '\0';
 	return dirname(dirpath);
 }
 
@@ -292,14 +296,9 @@ open_by_handle(
 {
 	int		fsfd;
 	char		*path;
-	void		*fshanp;
-	size_t		fshlen;
 	xfs_fsop_handlereq_t hreq;
 
-	if (handle_to_fshandle(hanp, hlen, &fshanp, &fshlen) != 0)
-		return -1;
-
-	if ((fsfd = handle_to_fsfd(fshanp, &path)) < 0)
+	if ((fsfd = handle_to_fsfd(hanp, &path)) < 0)
 		return -1;
 
 	hreq.fd       = 0;
@@ -398,8 +397,8 @@ attr_list_by_handle(
 	alhreq.buffer = buf;
 	alhreq.buflen = bufsize;
 	/* prevent needless EINVAL from the kernel */
-	if (alhreq.buflen > XATTR_LIST_MAX)
-		alhreq.buflen = XATTR_LIST_MAX;
+	if (alhreq.buflen > XFS_XATTR_LIST_MAX)
+		alhreq.buflen = XFS_XATTR_LIST_MAX;
 
 	error = xfsctl(path, fd, XFS_IOC_ATTRLIST_BY_HANDLE, &alhreq);
 
@@ -414,7 +413,7 @@ parents_by_handle(
 	parent_t	*buf,
 	size_t		bufsiz,
 	unsigned int	*count)
-	
+
 {
 	errno = EOPNOTSUPP;
 	return -1;
